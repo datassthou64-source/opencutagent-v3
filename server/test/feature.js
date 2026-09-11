@@ -1,7 +1,7 @@
 // Unit checks for the retake-review logic (no Premiere / network):
 // markDecisions (protected respected, summary) + applyReview (ordering, ripple)
 // + the panel applyDecisions RPC path.
-import { markDecisions, applyReview, summarize, computeExcessRanges } from "../review.js";
+import { markDecisions, applyReview, summarize, computeExcessRanges, reconcile } from "../review.js";
 import { createRpcDispatcher } from "../rpc/index.js";
 
 let failures = 0;
@@ -74,6 +74,45 @@ check("applies 2 cuts (protected skipped)", res.applied === 2, res);
 check("one batch call, ranges ascending", ctx.calls[0].ranges && ctx.calls[0].ranges[0].startFrame === 20 && ctx.calls[0].ranges[1].startFrame === 60, ctx.calls);
 check("removeGaps → one closeRangeGaps pass", ctx.calls.length === 2 && ctx.calls[1].ranges.length === 2, ctx.calls);
 check("protected frame 40 not cut", !ctx.calls[0].ranges.some((r) => r.startFrame === 40), ctx.calls[0].ranges);
+
+// --- cut frames come from integer TICKS, not from rounded seconds ---
+// Regression for the invisible-gap bug: a cut boundary that the seconds path
+// rounds to the WRONG frame lands next to an edit point a previous pass left
+// behind, and the razor/lift/close geometry then leaves a sliver nobody closes.
+{
+  const FT = TPS / 30; // ticks per frame
+  const raw = {
+    sequence: { name: "S", timebase: String(FT), frameRate: 30, zeroPointTicks: "0", dropFrame: false, videoTrackCount: 1, audioTrackCount: 1 },
+    clips: [{
+      id: "V1.0", name: "rec", trackType: "video", trackIndex: 0, itemIndex: 0, mediaPath: "m.mp4",
+      start: { seconds: 211 / 30, ticks: String(211 * FT) }, // clip sits at frame 211
+      end: { seconds: 511 / 30, ticks: String(511 * FT) },
+      inPoint: { seconds: 5, ticks: tk(5) },
+      outPoint: { seconds: 15, ticks: tk(15) },
+    }],
+    gaps: [],
+  };
+  // 0.4166s into the clip = 12.498 frames → frame 211 + 12 = 223. Via seconds:
+  // round3(7.4499333) = 7.45, and 7.45 * 30 = 223.5 → 224. One frame off.
+  const seg = {
+    index: 0, mediaPath: "m.mp4", sourceInSec: 5.4166, sourceOutSec: 6,
+    sourceSpeechInSec: null, sourceSpeechOutSec: null, wordCount: 2,
+    trackType: "video", trackIndex: 0, decision: "cut", protected: false,
+    durationSec: 0.5834, startFrame: 223, endFrame: 240, reason: null, group: null,
+  };
+  const ectx = {
+    calls: [],
+    bridge: { callHost: async (a, p) => { if (a === "getTimelineState") return raw; ectx.calls.push(p); return { ok: true }; }, notifyPanel: () => {} },
+    state: { revision: 0 },
+    review: { sequence: "S", frameRate: 30, dropFrame: false, segments: [seg] },
+  };
+  const { map } = await reconcile(ectx);
+  const naive = Math.round(map[0].liveStartSec * 30);
+  check("reconcile: tick-exact live frame", map[0].liveStartFrame === 223, { exact: map[0].liveStartFrame, naive, sec: map[0].liveStartSec });
+  check("reconcile: the old seconds rounding really was a frame off", naive === 224, naive);
+  await applyReview(ectx, { removeGaps: false });
+  check("applyReview razors the exact frame, not the rounded one", ectx.calls[0].ranges[0].startFrame === 223, ectx.calls[0].ranges);
+}
 
 // --- computeExcessRanges: trim non-speech air inside keeps ---
 {

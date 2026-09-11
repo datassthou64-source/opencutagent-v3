@@ -18,8 +18,9 @@ Two tabs, two price tags:
 
 - **Remove Silences** tab (free): loudness-based dead-air removal (ffmpeg only, no transcription, no API key). Waveform with draggable threshold, live-recomputing silence zones, pacing presets, margins, and an AI threshold suggestion.
 - **Retakes** tab (paid transcription): transcript-based cleanup. Loads the timeline as indexed spoken segments; Claude marks duplicate takes, false starts and filler as Cut; you review, override, protect, then apply.
+- **Retake V2 / AI word cuts:** Claude reviews the complete transcript in compact overlapping passes, then revisits only suspicious passages with word IDs and highlights exact removable words. You can refine every selection before applying it.
 - **Soft Apply:** instead of deleting, lays colored markers on the timeline (one hue per retake group, green over the suggested keeper) so you can pick final takes by hand.
-- **Fast apply:** big cut lists skip in-place razoring and rebuild the tightened sequence via Premiere's own XML round-trip, so a 2-hour timeline with 2000+ cuts applies in seconds, with effects and transforms preserved.
+- **In-place apply:** silence and retake cuts are applied directly to the active sequence, with a one-level undo snapshot.
 - **Export transcript:** saves the kept speech as a YouTube-ready `.srt`, with caption times matching the tightened video.
 - **Live sync:** the panel follows Premiere's playhead, highlights the segment under it, and clicking a segment seeks the timeline.
 
@@ -235,14 +236,12 @@ Then open the panel (it should show **Connected**) and click **Scan Audio**, or 
 - **"EvalScript error."** `premiere.jsx` didn't load; close and reopen the OpenCutAgent panel.
 - **Port 3001 busy.** Set `PREMIERE_BRIDGE_PORT` in `.env`; the panel auto-reads the negotiated port from `~/.editagent/bridge-port`.
 - **Transcription fails / Retakes tab errors.** Confirm `ELEVENLABS_API_KEY` is set, has the **speech_to_text** scope, and `ffmpeg -version` works. (The Remove Silences tab needs neither a key nor network.)
-- **A "Translation Report" alert during a big apply.** Benign: Premiere logs source-interpretation entries it re-derives on import. The report file lands in `.cache/rebuild/` if you want to read it.
-
 ## Good to know
 
 OpenCutAgent is built for the common case: talking-head footage on a normal A/V timeline. Two automatic behaviors worth knowing about:
 
-- **Big applies build a new sequence.** Large ripple applies rebuild the tightened cut via Premiere's own XML round-trip (seconds instead of minutes, with your effects and transforms preserved); the original sequence is left untouched as a backup.
-- **The fast path steps aside when it must.** Timelines with titles/graphics or speed-changed clips are applied by the (slower) in-place razor path instead. Everything still applies either way.
+- **Applies edit the active sequence.** OpenCutAgent razors and removes ranges in place; it does not create a separate `- tightened` sequence.
+- **Large applies can take longer.** They use the same in-place path as smaller jobs so effects, graphics, and sequence identity stay where they are.
 
 The transcription engine is pluggable (Scribe v2 today); the engine interface in `server/transcription/transcribe.js` accepts a Deepgram/Whisper drop-in.
 

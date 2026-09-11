@@ -1,8 +1,8 @@
 // Unit checks for clip-bounded retake segmentation + fragment classification.
 // Pure logic, synthetic words — no Premiere, no transcript cache needed.
-import { TICKS_PER_SECOND, sourceRangeToTimelineFrames } from "../transcription/timecode.js";
+import { TICKS_PER_SECOND, sourceRangeToTimelineFrames, timelineFrameToSourceTicks } from "../transcription/timecode.js";
 import { groupIntoPhrases, sliceWordsToWindow } from "../transcription/segments.js";
-import { partitionClip, classifyFragments, reconcile, reinsertTarget, planEditMarkers, MARKER_COLORS, srtTimestamp, wrapCaption, buildTranscriptCues, formatSrt } from "../review.js";
+import { partitionClip, classifyFragments, reconcile, reinsertTarget, reinsertTargetFrame, planEditMarkers, MARKER_COLORS, srtTimestamp, wrapCaption, buildTranscriptCues, formatSrt } from "../review.js";
 import { planRetakeChunks } from "../ai.js";
 
 const TPS = Number(TICKS_PER_SECOND);
@@ -83,6 +83,7 @@ check("autoCutEmpty:false tags but does not cut", segs2[0].fragment === "empty" 
 // --- end-to-end frame mapping for a real segment ---
 const fr = sourceRangeToTimelineFrames(parts[0].start, parts[0].end, c, TB);
 check("segment maps to a valid timeline frame range", fr && fr.endFrame > fr.startFrame, fr);
+check("snapped timeline frame maps back to exact source ticks", timelineFrameToSourceTicks(fr.startFrame, c, TB) === c.sourceIn.ticks, timelineFrameToSourceTicks(fr.startFrame, c, TB));
 
 // ============================================================
 //  reconcile() + reinsertTarget() — live source<->timeline mapping
@@ -130,6 +131,7 @@ const byIdx = (map) => Object.fromEntries(map.map((m) => [m.index, m]));
   check("reconcile: survivors present", m[0].state === "present" && m[2].state === "present", map);
   check("reconcile: downstream survivor shifted left", approx(m[2].liveStartSec, 3), m[2]);
   check("reinsertTarget: lands before next survivor", approx(reinsertTarget(SEGS, map, 1), 3), reinsertTarget(SEGS, map, 1));
+  check("reinsertTargetFrame: uses the next survivor's exact frame", reinsertTargetFrame(SEGS, map, 1, 30) === 90, reinsertTargetFrame(SEGS, map, 1, 30));
 }
 
 // partial: only a clip covering src [0,4]; seg [2,6] overlaps but isn't contained

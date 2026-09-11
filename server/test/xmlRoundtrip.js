@@ -1,12 +1,9 @@
 // Checks for the ROUND-TRIP XML rebuild (no Premiere): identity-preserving
 // parse/serialize, timing surgery on an exported-style xmeml (split/trim/delete,
 // pproTicks recompute, filter passthrough, link re-suffixing, file-def rescue,
-// transitions, markers), and the applyRangesBatched routing (round-trip first).
-import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+// transitions and markers). These helpers are retained but are no longer used
+// by the runtime apply path, which always edits the active sequence in place.
 import { parseXml, serializeXml, transformXmeml, ticksPerFrame } from "../roundtrip.js";
-import { applyRangesBatched } from "../silences.js";
 
 let failures = 0;
 function check(label, cond, got) {
@@ -131,44 +128,6 @@ check("transition-relative (-1) clipitem rejected", /transition-relative/.test(t
 threw = "";
 try { transformXmeml("<xmeml><foo/></xmeml>", CUTS, {}); } catch (e) { threw = e.message; }
 check("no <sequence> rejected", /no <sequence>/.test(threw), threw);
-
-// --- routing: round-trip is the preferred fast path ---
-const TIMELINE = {
-  sequence: { name: "My Seq", frameRate: 30, dropFrame: false, videoTrackCount: 1, audioTrackCount: 1, frameSize: { width: 2560, height: 1440 } },
-  clips: [],
-  gaps: [],
-};
-function makeCtx(onCall) {
-  const calls = [];
-  return {
-    calls,
-    cacheDir: mkdtempSync(join(tmpdir(), "ea-roundtrip-")),
-    bridge: {
-      callHost: async (action, params) => {
-        calls.push({ action, ...params });
-        if (onCall) { const r = onCall(action, params); if (r) return r; }
-        if (action === "exportXmlSequence") { writeFileSync(params.path, FIXTURE); return { ok: true, path: params.path }; }
-        if (action === "importXmlSequence") return { ok: true, sequenceName: params.sequenceName, opened: true, imported: 1 };
-        return { ok: true };
-      },
-      notifyPanel: () => {},
-    },
-    state: { revision: 0 },
-  };
-}
-
-const ctxR = makeCtx();
-const rr = await applyRangesBatched(ctxR, CUTS.map((c) => ({ ...c })), { ripple: true, fps: 30, timeline: TIMELINE, rebuildMin: 1 });
-check("routed export → import, no razor ops", ctxR.calls.map((c) => c.action).join(",") === "exportXmlSequence,importXmlSequence", ctxR.calls.map((c) => c.action));
-check("result: roundtrip rebuild, applied 2, ~4s", rr.rebuild === true && rr.roundtrip === true && rr.applied === 2 && Math.abs(rr.appliedSec - 4) < 1e-6, rr);
-const imp = ctxR.calls.find((c) => c.action === "importXmlSequence");
-check("transformed xml written: renamed, effects intact", existsSync(imp.path) && /My Seq - tightened/.test(readFileSync(imp.path, "utf8")) && /<value>133<\/value>/.test(readFileSync(imp.path, "utf8")), imp.path);
-
-// export failure → falls back to the GENERATED rebuild (which needs timeline clips → none here → razor)
-const ctxF = makeCtx((action) => { if (action === "exportXmlSequence") throw new Error("export blew up"); });
-const rf = await applyRangesBatched(ctxF, CUTS.map((c) => ({ ...c })), { ripple: true, fps: 30, timeline: TIMELINE, rebuildMin: 1 });
-check("export failure falls through (no roundtrip result)", !rf.roundtrip, rf);
-check("fallback chain reached the razor path", ctxF.calls.some((c) => c.action === "removeRangesBatch"), ctxF.calls.map((c) => c.action));
 
 console.log(failures === 0 ? "\nAll xml-roundtrip checks passed." : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

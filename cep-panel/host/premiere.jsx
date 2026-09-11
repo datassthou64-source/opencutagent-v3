@@ -102,9 +102,14 @@ $.editagent = (function () {
   }
 
   function detectDropFrame(seq, fps) {
-    // Drop-frame applies ONLY to true 29.97 (30000/1001) and 59.94 (60000/1001).
-    // Tight tolerance so a ~30.00003 "30 fps" sequence is correctly NON-drop —
-    // a loose check here builds drop timecodes that razor at the wrong frames.
+    // The display format is authoritative: 29.97/59.94 may be drop OR non-drop.
+    // Older builds that do not expose it fall back to the legacy rate check.
+    try {
+      var display = Number(seq.videoDisplayFormat);
+      if (display === 102 || display === 106) return true;
+      if (display === 103 || display === 107) return false;
+    } catch (e) {}
+    // Tight fallback tolerance keeps a ~30.00003 sequence non-drop.
     return Math.abs(fps - 30000 / 1001) < 0.005 || Math.abs(fps - 60000 / 1001) < 0.005;
   }
 
@@ -133,28 +138,96 @@ $.editagent = (function () {
     return String(Math.round(sec * TPS));
   }
 
+  /* ---------- integer-frame helpers (the cut path runs on these) ----------
+     Everything that razors, deletes or ripples must agree on WHICH FRAME it is
+     talking about. Reading positions as clip.start.seconds and moving clips by a
+     seconds offset loses that: seconds are floats, the sequence timebase is often
+     non-integer (a "30 fps" sequence is 30.00003), and a move by a fractional
+     frame lands a clip a hair off the grid. Premiere then snaps it, and the
+     leftover sliver shows up as an unselectable 1-frame black gap between scenes.
+     Ticks are exact integers (254016000000 per second, seq.timebase per frame),
+     so frame = ticks / timebase is exact and a move of N frames is N * timebase
+     ticks with no rounding anywhere. */
+
+  function tickFrames(ticks, timebase) {
+    // ticks is a string of an exact integer; Number() is lossless well past any
+    // real sequence length (2^53 ticks ~ 10h at 30fps).
+    return Math.round(Number(ticks) / timebase);
+  }
+
+  function clipFrames(clip, timebase) {
+    return { s: tickFrames(clip.start.ticks, timebase), e: tickFrames(clip.end.ticks, timebase) };
+  }
+
+  function timeFromTicks(ticks) {
+    var t = new Time();
+    try {
+      t.ticks = String(Math.round(ticks));
+      return t;
+    } catch (e) {}
+    var t2 = new Time();
+    t2.seconds = ticks / TPS;
+    return t2;
+  }
+
+  // A Time of exactly N frames (N may be negative, for a ripple move left).
+  // Falls back to seconds if this build refuses a ticks assignment.
+  function frameTime(frames, timebase) {
+    return timeFromTicks(Math.round(frames) * timebase);
+  }
+
+  // QE's razor takes a formatted ruler timecode, not a raw Time. Let Premiere
+  // format an exact frame-tick position using the sequence's own display mode;
+  // the manual formatter is only a compatibility fallback for older builds.
+  function frameToSequenceTC(seq, frame, timebase, nominal, drop) {
+    try {
+      var at = frameTime(frame, timebase);
+      var oneFrame = frameTime(1, timebase);
+      return at.getFormatted(oneFrame, seq.videoDisplayFormat);
+    } catch (e) {
+      return framesToTC(frame, nominal, drop);
+    }
+  }
+
+  // Move to an ABSOLUTE frame target. A relative whole-frame move preserves any
+  // pre-existing subframe residue; this corrects that residue as part of the
+  // move, then verifies Premiere actually accepted the exact target.
+  function moveClipToFrame(clip, targetFrame, timebase) {
+    targetFrame = Math.round(targetFrame);
+    var targetTicks = targetFrame * timebase;
+    var beforeTicks = Number(clip.start.ticks);
+    clip.move(timeFromTicks(targetTicks - beforeTicks));
+    var afterTicks = Number(clip.start.ticks);
+    return {
+      ok: Math.abs(afterTicks - targetTicks) <= 1,
+      targetFrame: targetFrame,
+      actualFrame: tickFrames(afterTicks, timebase),
+      tickError: afterTicks - targetTicks
+    };
+  }
+
   /* ---------- handlers ---------- */
 
   function ping() {
     return { pong: true, app: app.appName ? app.appName : "Premiere", version: app.version ? app.version : "" };
   }
 
-  function collectTrackClips(tracks, type, clipsOut, gapsOut) {
+  function collectTrackClips(tracks, type, clipsOut, gapsOut, timebase) {
     var prefix = type === "video" ? "V" : "A";
     for (var i = 0; i < tracks.numTracks; i++) {
       var track = tracks[i];
       var n = track.clips.numItems;
-      var prevEnd = 0;
+      var prevEndFrame = 0;
       for (var j = 0; j < n; j++) {
         var clip = track.clips[j];
         var startSec = clip.start.seconds;
         var endSec = clip.end.seconds;
-        var gap = startSec - prevEnd;
-        if (gap > 0.0005) {
+        var f = clipFrames(clip, timebase);
+        if (f.s > prevEndFrame) {
           gapsOut.push({
             trackType: type,
             trackIndex: i,
-            start: { ticks: secToTicksStr(prevEnd), seconds: prevEnd },
+            start: { ticks: String(prevEndFrame * timebase), seconds: (prevEndFrame * timebase) / TPS },
             end: { ticks: String(clip.start.ticks), seconds: startSec }
           });
         }
@@ -174,7 +247,7 @@ $.editagent = (function () {
           inPoint: { ticks: String(clip.inPoint.ticks), seconds: clip.inPoint.seconds },
           outPoint: { ticks: String(clip.outPoint.ticks), seconds: clip.outPoint.seconds }
         });
-        prevEnd = endSec;
+        prevEndFrame = Math.max(prevEndFrame, f.e);
       }
     }
   }
@@ -185,8 +258,8 @@ $.editagent = (function () {
     var fps = TPS / Number(timebase);
     var clips = [];
     var gaps = [];
-    collectTrackClips(seq.videoTracks, "video", clips, gaps);
-    collectTrackClips(seq.audioTracks, "audio", clips, gaps);
+    collectTrackClips(seq.videoTracks, "video", clips, gaps, Number(timebase));
+    collectTrackClips(seq.audioTracks, "audio", clips, gaps, Number(timebase));
     var fsH = null, fsV = null;
     try { fsH = seq.frameSizeHorizontal; fsV = seq.frameSizeVertical; } catch (eFS) {}
     return {
@@ -207,14 +280,25 @@ $.editagent = (function () {
   }
 
   function trimClip(p) {
-    var track = getTrack(p.trackType, p.trackIndex);
+    var seq = requireSeq();
+    var timebase = Number(seq.timebase);
+    var track = p.trackType === "video" ? seq.videoTracks[p.trackIndex] : seq.audioTracks[p.trackIndex];
     var clip = track.clips[p.itemIndex];
     if (!clip) throw new Error("Clip not found at " + p.trackType + " track " + p.trackIndex + " item " + p.itemIndex + ".");
-    // Source in/out is the most reliable trim path; set those first.
-    if (p.sourceInSec != null) clip.inPoint = makeTime(p.sourceInSec);
-    if (p.sourceOutSec != null) clip.outPoint = makeTime(p.sourceOutSec);
-    if (p.timelineStartSec != null) clip.start = makeTime(p.timelineStartSec);
-    if (p.timelineEndSec != null) clip.end = makeTime(p.timelineEndSec);
+    function requestedTime(frame, sec) {
+      if (frame != null) return frameTime(frame, timebase);
+      if (sec != null) return frameTime(tickFrames(secToTicksStr(sec), timebase), timebase);
+      return null;
+    }
+    // All four requested edges are snapped to the active sequence frame grid.
+    var sourceIn = requestedTime(p.sourceInFrame, p.sourceInSec);
+    var sourceOut = requestedTime(p.sourceOutFrame, p.sourceOutSec);
+    var timelineStart = requestedTime(p.timelineStartFrame, p.timelineStartSec);
+    var timelineEnd = requestedTime(p.timelineEndFrame, p.timelineEndSec);
+    if (sourceIn) clip.inPoint = sourceIn;
+    if (sourceOut) clip.outPoint = sourceOut;
+    if (timelineStart) clip.start = timelineStart;
+    if (timelineEnd) clip.end = timelineEnd;
     return {
       ok: true,
       start: clip.start.seconds,
@@ -224,26 +308,48 @@ $.editagent = (function () {
     };
   }
 
-  function closeGapsOnTrack(track, type, trackIndex, minGap, details) {
+  function closeGapsOnTrack(track, type, trackIndex, minGap, details, timebase) {
+    // Frames, not seconds: a gap is a whole number of frames and closing it must
+    // move the clip by exactly that many, or the clip lands off the frame grid and
+    // the "closed" gap survives as a 1-frame black sliver.
+    var fps = TPS / timebase;
     var items = [];
     var n = track.clips.numItems;
     for (var j = 0; j < n; j++) {
       var c = track.clips[j];
-      items.push({ clip: c, start: c.start.seconds, end: c.end.seconds });
+      var f = clipFrames(c, timebase);
+      items.push({ clip: c, start: f.s, end: f.e });
     }
     items.sort(function (a, b) {
       return a.start - b.start;
     });
+    var minGapFrames = Math.max(1, Math.round(minGap * fps));
     var cursor = 0;
     var closed = 0;
     for (var k = 0; k < items.length; k++) {
       var it = items[k];
       var gap = it.start - cursor;
-      if (gap >= minGap && gap > 0) {
-        it.clip.move(makeTime(-gap)); // negative offset moves the clip earlier
-        details.push({ track: (type === "video" ? "V" : "A") + (trackIndex + 1), seconds: gap });
-        closed++;
-        cursor = it.end - gap;
+      if (gap >= minGapFrames) {
+        var target = it.start - gap;
+        try {
+          var placed = moveClipToFrame(it.clip, target, timebase);
+          details.push({
+            track: (type === "video" ? "V" : "A") + (trackIndex + 1),
+            frames: gap,
+            seconds: gap / fps,
+            aligned: placed.ok
+          });
+          if (placed.ok) closed++;
+        } catch (e) {
+          details.push({
+            track: (type === "video" ? "V" : "A") + (trackIndex + 1),
+            frames: gap,
+            seconds: gap / fps,
+            aligned: false,
+            error: String(e && e.message ? e.message : e)
+          });
+        }
+        try { cursor = clipFrames(it.clip, timebase).e; } catch (e2) { cursor = it.end; }
       } else {
         cursor = it.end;
       }
@@ -253,6 +359,7 @@ $.editagent = (function () {
 
   function removeGaps(p) {
     var seq = requireSeq();
+    var timebase = Number(seq.timebase);
     var minGap = p.minGapSec != null ? p.minGapSec : 0.0005;
     var details = [];
     var closed = 0;
@@ -262,30 +369,30 @@ $.editagent = (function () {
       var vt = seq.videoTracks;
       for (var i = 0; i < vt.numTracks; i++) {
         if (onlyIndex !== null && onlyIndex !== i) continue;
-        closed += closeGapsOnTrack(vt[i], "video", i, minGap, details);
+        closed += closeGapsOnTrack(vt[i], "video", i, minGap, details, timebase);
       }
     }
     if (doType === null || doType === "audio") {
       var at = seq.audioTracks;
       for (var a = 0; a < at.numTracks; a++) {
         if (onlyIndex !== null && onlyIndex !== a) continue;
-        closed += closeGapsOnTrack(at[a], "audio", a, minGap, details);
+        closed += closeGapsOnTrack(at[a], "audio", a, minGap, details, timebase);
       }
     }
     return { count: closed, closed: details };
   }
 
-  function removeMiddle(tracks, startFrame, fps, ripple) {
+  function removeMiddle(tracks, startFrame, timebase, ripple) {
     var removed = 0;
     for (var i = 0; i < tracks.numTracks; i++) {
       var track = tracks[i];
       for (var j = 0; j < track.clips.numItems; j++) {
         var c = track.clips[j];
-        var cf = Math.round(c.start.seconds * fps);
-        if (Math.abs(cf - startFrame) <= 1) {
+        var cf = tickFrames(c.start.ticks, timebase);
+        if (cf === startFrame) {
           try {
             // ripple=true closes the gap (downstream shifts left); false lifts (leaves a gap).
-            c.remove(ripple, false);
+            c.remove(ripple, true);
             removed++;
           } catch (e) {}
           break;
@@ -298,13 +405,13 @@ $.editagent = (function () {
   function removeRange(p) {
     var ripple = p.ripple === false ? false : true;
     var seq = requireSeq();
-    var timebase = String(seq.timebase);
-    var fps = TPS / Number(timebase);
+    var timebase = Number(seq.timebase);
+    var fps = TPS / timebase;
     var drop = detectDropFrame(seq, fps);
     var nominal = Math.round(fps);
-    var zpFrames = Math.round((Number(seq.zeroPoint) / TPS) * fps);
-    var startTC = framesToTC(p.startFrame + zpFrames, nominal, drop);
-    var endTC = framesToTC(p.endFrame + zpFrames, nominal, drop);
+    var zpFrames = tickFrames(seq.zeroPoint, timebase);
+    var startTC = frameToSequenceTC(seq, p.startFrame + zpFrames, timebase, nominal, drop);
+    var endTC = frameToSequenceTC(seq, p.endFrame + zpFrames, timebase, nominal, drop);
 
     app.enableQE();
     var qeSeq = qe.project.getActiveSequence();
@@ -325,8 +432,8 @@ $.editagent = (function () {
     }
 
     var removed = 0;
-    removed += removeMiddle(seq.videoTracks, p.startFrame, fps, ripple);
-    removed += removeMiddle(seq.audioTracks, p.startFrame, fps, ripple);
+    removed += removeMiddle(seq.videoTracks, p.startFrame, timebase, ripple);
+    removed += removeMiddle(seq.audioTracks, p.startFrame, timebase, ripple);
     return { ok: true, startTC: startTC, endTC: endTC, tracksAffected: removed, ripple: ripple };
   }
 
@@ -341,10 +448,11 @@ $.editagent = (function () {
 
   function removeRangesBatch(p) {
     var seq = requireSeq();
-    var fps = TPS / Number(seq.timebase);
+    var timebase = Number(seq.timebase);
+    var fps = TPS / timebase;
     var drop = detectDropFrame(seq, fps);
     var nominal = Math.round(fps);
-    var zpFrames = Math.round((Number(seq.zeroPoint) / TPS) * fps);
+    var zpFrames = tickFrames(seq.zeroPoint, timebase);
     var ranges = p.ranges || [];
     var i;
 
@@ -354,8 +462,8 @@ $.editagent = (function () {
     function razorTrack(qtrack) {
       if (!qtrack) return;
       for (var k = 0; k < ranges.length; k++) {
-        try { qtrack.razor(framesToTC(ranges[k].startFrame + zpFrames, nominal, drop)); } catch (e) {}
-        try { qtrack.razor(framesToTC(ranges[k].endFrame + zpFrames, nominal, drop)); } catch (e2) {}
+        try { qtrack.razor(frameToSequenceTC(seq, ranges[k].startFrame + zpFrames, timebase, nominal, drop)); } catch (e) {}
+        try { qtrack.razor(frameToSequenceTC(seq, ranges[k].endFrame + zpFrames, timebase, nominal, drop)); } catch (e2) {}
       }
     }
     for (i = 0; i < seq.videoTracks.numTracks; i++) {
@@ -369,35 +477,53 @@ $.editagent = (function () {
       razorTrack(qa);
     }
 
-    // Which range fully contains [cs,ce]? Ascending ranges → binary search on
-    // startFrame, then containment with the same 1-frame slack removeMiddle used.
-    function rangeIndexOf(cs, ce) {
+    // Last range starting at or before cs (ascending, non-overlapping → binary search).
+    function findRange(cs) {
       var lo = 0, hi = ranges.length - 1, found = -1;
       while (lo <= hi) {
         var mid = (lo + hi) >> 1;
-        if (ranges[mid].startFrame <= cs + 1) { found = mid; lo = mid + 1; } else hi = mid - 1;
+        if (ranges[mid].startFrame <= cs) { found = mid; lo = mid + 1; } else hi = mid - 1;
       }
-      if (found < 0) return -1;
-      if (ce > cs && cs >= ranges[found].startFrame - 1 && ce <= ranges[found].endFrame + 1) return found;
-      return -1;
+      return found;
     }
 
     var removedIdx = {};
     var pieces = 0;
+    var failed = 0;
+    var straddling = 0;
     function liftTrack(track) {
       // descending index so removals never invalidate the still-pending indices;
       // lift (remove(false)) leaves a gap, so no other clip moves.
       for (var k = track.clips.numItems - 1; k >= 0; k--) {
         var c = track.clips[k];
-        var cs = Math.round(c.start.seconds * fps);
-        var ce = Math.round(c.end.seconds * fps);
-        var ri = rangeIndexOf(cs, ce);
-        if (ri < 0) continue;
-        try {
-          c.remove(false, false);
-          removedIdx[ri] = true;
-          pieces++;
-        } catch (e) {}
+        var cf = clipFrames(c, timebase);
+        var cs = cf.s, ce = cf.e;
+        if (ce <= cs) continue;
+        var idx = findRange(cs);
+        var r = idx >= 0 ? ranges[idx] : null;
+        // EXACT containment only. This used to allow a 1-frame overhang on each
+        // side ("cs >= startFrame - 1 && ce <= endFrame + 1"), which swallowed a
+        // neighbouring 1-frame sliver whenever an earlier pass had left an edit
+        // point right next to the cut. closeRangeGaps then rippled by the
+        // REQUESTED width, so the extra emptied frame survived as a gap too small
+        // to see or select. Compensating in the ripple is NOT an option: tracks
+        // over-delete independently, so a per-track shift would desync A from V.
+        // Matching exactly keeps hole == range on every track, which is the only
+        // way the single uniform shift stays correct.
+        if (r && cs >= r.startFrame && ce <= r.endFrame) {
+          try {
+            c.remove(false, true);
+            removedIdx[idx] = true;
+            pieces++;
+          } catch (e) { failed++; } // surfaced by the server instead of vanishing
+          continue;
+        }
+        // Overlaps a range without being contained: the razor didn't land where we
+        // asked. Deleting it would take footage the user never marked, so leave it
+        // alone and report it (closeRangeGaps sees the range still occupied and
+        // skips the shift, so the timeline stays consistent).
+        var nxt = idx + 1 < ranges.length ? ranges[idx + 1] : null;
+        if ((r && ce > r.startFrame && cs < r.endFrame) || (nxt && ce > nxt.startFrame && cs < nxt.endFrame)) straddling++;
       }
     }
     for (i = 0; i < seq.videoTracks.numTracks; i++) liftTrack(seq.videoTracks[i]);
@@ -405,7 +531,10 @@ $.editagent = (function () {
 
     var removedIndexes = [];
     for (i = 0; i < ranges.length; i++) if (removedIdx[i]) removedIndexes.push(i);
-    return { ok: true, requested: ranges.length, removedIndexes: removedIndexes, pieces: pieces };
+    return {
+      ok: true, requested: ranges.length, removedIndexes: removedIndexes,
+      pieces: pieces, failed: failed, straddling: straddling
+    };
   }
 
   // Close ONLY the gaps removeRangesBatch left: per track, a range counts toward
@@ -414,44 +543,63 @@ $.editagent = (function () {
   // old per-track ripple semantics). Pre-existing gaps are untouched.
   function closeRangeGaps(p) {
     var seq = requireSeq();
-    var fps = TPS / Number(seq.timebase);
+    var timebase = Number(seq.timebase);
     var ranges = p.ranges || []; // ascending, non-overlapping
-    var slack = 1.5 / fps;
+    // Integer frames throughout: clip edges come from ticks and the shift is a
+    // whole number of frames, so a range's hole and the ripple that closes it are
+    // the same width BY CONSTRUCTION. The old code did this in seconds with a
+    // half-frame slack to absorb float noise; any leftover fraction became an
+    // invisible black sliver between the scenes. There is no fraction to absorb
+    // now, so the slack is gone too.
     var moved = 0;
+    var failed = 0;
+    var misaligned = 0;
 
     function closeTrack(track) {
       var items = [];
       var j;
       for (j = 0; j < track.clips.numItems; j++) {
         var c = track.clips[j];
-        items.push({ clip: c, s: c.start.seconds });
+        var f = clipFrames(c, timebase);
+        items.push({ clip: c, s: f.s, e: f.e });
       }
       items.sort(function (a, b) { return a.s - b.s; });
 
-      // seconds each range contributes on THIS track (0 while still occupied)
+      // frames each range contributes on THIS track (0 while still occupied)
       var durs = [];
       var k = 0;
       for (var r = 0; r < ranges.length; r++) {
-        var rs = ranges[r].startFrame / fps;
-        var re = ranges[r].endFrame / fps;
-        while (k < items.length && items[k].clip.end.seconds <= rs + slack) k++;
-        durs.push(k < items.length && items[k].s < re - slack ? 0 : re - rs);
+        var rs = ranges[r].startFrame;
+        var re = ranges[r].endFrame;
+        while (k < items.length && items[k].e <= rs) k++;
+        durs.push(k < items.length && items[k].s < re ? 0 : re - rs);
       }
 
-      // shift each clip left once by the emptied duration before it; ascending
+      // shift each clip left once by the emptied frames before it; ascending
       // is safe (earlier clips shift by no more and have already moved).
       var cum = 0, ri = 0;
       for (j = 0; j < items.length; j++) {
-        while (ri < ranges.length && ranges[ri].endFrame / fps <= items[j].s + slack) { cum += durs[ri]; ri++; }
-        if (cum > 0.0001) {
-          try { items[j].clip.move(makeTime(-cum)); moved++; } catch (e) {}
+        while (ri < ranges.length && ranges[ri].endFrame <= items[j].s) { cum += durs[ri]; ri++; }
+        if (cum > 0) {
+          var target = items[j].s - cum;
+          try {
+            var placed = moveClipToFrame(items[j].clip, target, timebase);
+            if (placed.ok) moved++;
+            else misaligned++;
+          } catch (e) { failed++; }
         }
       }
     }
     var i;
     for (i = 0; i < seq.videoTracks.numTracks; i++) closeTrack(seq.videoTracks[i]);
     for (i = 0; i < seq.audioTracks.numTracks; i++) closeTrack(seq.audioTracks[i]);
-    return { ok: true, moved: moved, ranges: ranges.length };
+    return {
+      ok: failed === 0 && misaligned === 0,
+      moved: moved,
+      failed: failed,
+      misaligned: misaligned,
+      ranges: ranges.length
+    };
   }
 
   // Mute a timeline range on the AUDIO tracks only (keep the picture): razor at
@@ -460,13 +608,13 @@ $.editagent = (function () {
   // is version-dependent, so each disable is guarded.
   function muteRange(p) {
     var seq = requireSeq();
-    var timebase = String(seq.timebase);
-    var fps = TPS / Number(timebase);
+    var timebase = Number(seq.timebase);
+    var fps = TPS / timebase;
     var drop = detectDropFrame(seq, fps);
     var nominal = Math.round(fps);
-    var zpFrames = Math.round((Number(seq.zeroPoint) / TPS) * fps);
-    var startTC = framesToTC(p.startFrame + zpFrames, nominal, drop);
-    var endTC = framesToTC(p.endFrame + zpFrames, nominal, drop);
+    var zpFrames = tickFrames(seq.zeroPoint, timebase);
+    var startTC = frameToSequenceTC(seq, p.startFrame + zpFrames, timebase, nominal, drop);
+    var endTC = frameToSequenceTC(seq, p.endFrame + zpFrames, timebase, nominal, drop);
 
     app.enableQE();
     var qeSeq = qe.project.getActiveSequence();
@@ -484,10 +632,10 @@ $.editagent = (function () {
       var track = seq.audioTracks[i];
       for (var j = 0; j < track.clips.numItems; j++) {
         var c = track.clips[j];
-        var cs = Math.round(c.start.seconds * fps);
-        var ce = Math.round(c.end.seconds * fps);
-        // item lands within the muted span (1-frame slack absorbs razor rounding)
-        if (ce > cs && cs >= p.startFrame - 1 && ce <= p.endFrame + 1) {
+        var mf = clipFrames(c, timebase);
+        var cs = mf.s, ce = mf.e;
+        // Exact containment only: every razor boundary and comparison is a frame.
+        if (ce > cs && cs >= p.startFrame && ce <= p.endFrame) {
           try {
             c.disabled = true;
             muted++;
@@ -551,6 +699,7 @@ $.editagent = (function () {
   // server verifies afterward and Cmd+Z is the guaranteed fallback.
   function restoreTimeline(p) {
     var seq = requireSeq();
+    var timebase = Number(seq.timebase);
     var clips = p.clips || [];
     var byKey = {};
     var i, k, m;
@@ -618,13 +767,23 @@ $.editagent = (function () {
       for (k = planOps.length - 1; k >= 0; k--) {
         var op = planOps[k];
         for (var e = 0; e < op.extras.length; e++) {
-          try { op.extras[e].clip.remove(false, false); removed++; } catch (ex) {}
+          try { op.extras[e].clip.remove(false, true); removed++; } catch (ex) {}
         }
         var clip2 = op.survivor.clip;
-        clip2.inPoint = makeTime(op.o.inSec);
-        clip2.outPoint = makeTime(op.o.outSec);
-        clip2.start = makeTime(op.o.startSec);
-        clip2.end = makeTime(op.o.endSec);
+        // New snapshots carry exact ticks. Older ones are snapped to the active
+        // sequence frame grid rather than restored through floating seconds.
+        clip2.inPoint = op.o.inTicks != null
+          ? timeFromTicks(Number(op.o.inTicks))
+          : frameTime(tickFrames(secToTicksStr(op.o.inSec), timebase), timebase);
+        clip2.outPoint = op.o.outTicks != null
+          ? timeFromTicks(Number(op.o.outTicks))
+          : frameTime(tickFrames(secToTicksStr(op.o.outSec), timebase), timebase);
+        clip2.start = op.o.startTicks != null
+          ? timeFromTicks(Number(op.o.startTicks))
+          : frameTime(tickFrames(secToTicksStr(op.o.startSec), timebase), timebase);
+        clip2.end = op.o.endTicks != null
+          ? timeFromTicks(Number(op.o.endTicks))
+          : frameTime(tickFrames(secToTicksStr(op.o.endSec), timebase), timebase);
         resized++;
       }
     }
@@ -668,8 +827,9 @@ $.editagent = (function () {
   // Steer a project item's source in/out to [inSec,outSec] for the next insert.
   // setInPoint/setOutPoint signatures vary by version, so try the common forms;
   // placed timeline items keep their own in/out, so this is safe best-effort.
-  function setItemInOut(pItem, inSec, outSec) {
+  function setItemInOut(pItem, inSec, outSec, inTicks, outTicks) {
     var forms = [
+      function () { pItem.setInPoint(String(inTicks), 4); pItem.setOutPoint(String(outTicks), 4); },
       function () { pItem.setInPoint(inSec, 4); pItem.setOutPoint(outSec, 4); },
       function () { pItem.setInPoint(inSec); pItem.setOutPoint(outSec); },
       function () { pItem.setInPoint(makeTime(inSec), 4); pItem.setOutPoint(makeTime(outSec), 4); },
@@ -712,7 +872,6 @@ $.editagent = (function () {
       throw new Error("This Premiere build has no sequence.insertClip — re-insert isn't supported here.");
     }
     var timebase = Number(seq.timebase);
-    var fps = TPS / timebase;
     var vIdx = p.trackIndex != null ? p.trackIndex : 0;
 
     var pItem = findProjectItemByPath(p.mediaPath);
@@ -720,46 +879,48 @@ $.editagent = (function () {
 
     // Snap target + source range to whole frames so the insert lands on a clip edge
     // (never one frame inside a neighbor, which would split it).
-    function snapSec(sec) {
-      var ticks = Math.round(sec * TPS);
-      return (Math.round(ticks / timebase) * timebase) / TPS;
-    }
-    var targetSec = snapSec(p.targetSeconds != null ? p.targetSeconds : 0);
-    var inSec = snapSec(p.sourceInSec);
-    var outSec = snapSec(p.sourceOutSec);
+    function snapFrame(sec) { return tickFrames(secToTicksStr(sec), timebase); }
+    var targetFrame = p.targetFrame != null ? Math.round(p.targetFrame) : snapFrame(p.targetSeconds != null ? p.targetSeconds : 0);
+    var targetTicks = targetFrame * timebase;
+    var targetSec = targetTicks / TPS;
+    var inTicks = p.sourceInTicks != null ? Number(p.sourceInTicks) : snapFrame(p.sourceInSec) * timebase;
+    var outTicks = p.sourceOutTicks != null ? Number(p.sourceOutTicks) : snapFrame(p.sourceOutSec) * timebase;
+    var inSec = inTicks / TPS;
+    var outSec = outTicks / TPS;
 
     var savedIn = null, savedOut = null;
     try { savedIn = pItem.getInPoint(); } catch (e) {}
     try { savedOut = pItem.getOutPoint(); } catch (e) {}
-    setItemInOut(pItem, inSec, outSec);
+    setItemInOut(pItem, inSec, outSec, inTicks, outTicks);
 
     var targeting = setTargetTracks(seq, vIdx);
     var err = null;
     try {
-      seq.insertClip(pItem, makeTime(targetSec), vIdx, 0);
+      seq.insertClip(pItem, frameTime(targetFrame, timebase), vIdx, 0);
     } catch (e1) {
       // some builds reject explicit track indices — retry relying on targeting
-      try { seq.insertClip(pItem, makeTime(targetSec)); } catch (e2) { err = String(e2 && e2.message ? e2.message : e2); }
+      try { seq.insertClip(pItem, frameTime(targetFrame, timebase)); } catch (e2) { err = String(e2 && e2.message ? e2.message : e2); }
     }
     restoreTargetTracks(seq, targeting);
-    if (savedIn != null && savedOut != null) { try { setItemInOut(pItem, savedIn.seconds, savedOut.seconds); } catch (e3) {} }
+    if (savedIn != null && savedOut != null) {
+      try { setItemInOut(pItem, savedIn.seconds, savedOut.seconds, savedIn.ticks, savedOut.ticks); } catch (e3) {}
+    }
 
     if (err) throw new Error("insertClip failed: " + err);
 
     // Report the clip now sitting at the target so the server can sanity-check.
     var placed = null;
-    var tFrame = Math.round(targetSec * fps);
     var vt2 = seq.videoTracks[vIdx];
     if (vt2) {
       for (var j = 0; j < vt2.clips.numItems; j++) {
         var c2 = vt2.clips[j];
-        if (Math.abs(Math.round(c2.start.seconds * fps) - tFrame) <= 1) {
+        if (tickFrames(c2.start.ticks, timebase) === targetFrame) {
           placed = { start: c2.start.seconds, end: c2.end.seconds, inPoint: c2.inPoint.seconds, outPoint: c2.outPoint.seconds };
           break;
         }
       }
     }
-    return { ok: true, targetSeconds: targetSec, placed: placed };
+    return { ok: true, targetSeconds: targetSec, targetFrame: targetFrame, placed: placed };
   }
 
   // ---- Soft Apply: non-destructive colored markers (Retakes tab) ----

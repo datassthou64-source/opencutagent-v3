@@ -1,23 +1,40 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, rmSync } from "node:fs";
-import { basename, extname, join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, statSync, rmSync } from "node:fs";
+import { basename, extname, join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { log } from "../log.js";
 import { liveEnv } from "../config.js";
 import { recordUsage } from "../usage.js";
 
-const SCRIBE_URL = "https://api.elevenlabs.io/v1/speech-to-text";
-// ElevenLabs Scribe batch API list price; override in .env if their pricing changes.
-const scribeRatePerHourUsd = () => Number(liveEnv("EDITAGENT_SCRIBE_RATE") || 0.22);
-// Model precedence: explicit opt (panel dropdown) > .env > default.
-const scribeModel = (m) => m || liveEnv("EDITAGENT_SCRIBE_MODEL") || "scribe_v2";
 const FFMPEG_BIN = process.env.FFMPEG_BIN || "ffmpeg";
 
+// Local transcription via HyperFrames whisper (whisper.cpp): no API key, no network,
+// no per-minute bill. Model precedence: explicit opt (panel dropdown) > .env > default.
+// A model value we don't recognize (e.g. a stale "scribe_v2" left in the panel dropdown)
+// falls back to the default instead of failing the whisper CLI.
+const WHISPER_MODELS = new Set(["tiny.en", "base.en", "small.en", "medium.en", "large-v3"]);
+function whisperModel(m) {
+  if (m && WHISPER_MODELS.has(m)) return m;
+  const env = liveEnv("EDITAGENT_WHISPER_MODEL");
+  if (env && WHISPER_MODELS.has(env)) return env;
+  return "small.en";
+}
+
+// npx living next to the node that runs us survives a GUI-launched minimal PATH
+// (Premiere auto-starts the server with a stripped env, so bare "npx" may not resolve);
+// fall back to "npx" on PATH.
+function npxBin() {
+  const name = process.platform === "win32" ? "npx.cmd" : "npx";
+  const cand = join(dirname(process.execPath), name);
+  return existsSync(cand) ? cand : name;
+}
+
 /**
- * Pluggable transcription engine interface. v1 ships ElevenLabs Scribe; the
- * shape ({ words: [{ type, text, start, end, speaker_id }] }) is what
- * segments.js consumes, so a Deepgram/Whisper engine only needs to map into it.
+ * Pluggable transcription engine interface. The engine ships HyperFrames whisper
+ * (local whisper.cpp, no API key); the shape ({ words: [{ type, text, start, end }] })
+ * is what segments.js consumes (type defaults to "word", speaker_id to null), so any
+ * engine only needs to map into it.
  */
 
 export class TranscribeError extends Error {
@@ -259,43 +276,37 @@ export function mergeWords(existing, incoming) {
   return out;
 }
 
-async function callScribe(wavPath, apiKey, { model, language, numSpeakers } = {}) {
-  const buf = readFileSync(wavPath);
-  const form = new FormData();
-  form.append("file", new Blob([buf], { type: "audio/wav" }), basename(wavPath));
-  form.append("model_id", scribeModel(model));
-  form.append("diarize", "true");
-  form.append("tag_audio_events", "true");
-  form.append("timestamps_granularity", "word");
-  if (language) form.append("language_code", language);
-  if (numSpeakers) form.append("num_speakers", String(numSpeakers));
-
-  const resp = await fetch(SCRIBE_URL, {
-    method: "POST",
-    headers: { "xi-api-key": apiKey },
-    body: form,
-  });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    let detail = null;
-    try { detail = JSON.parse(text).detail; } catch { /* not JSON */ }
-    if (detail?.status === "quota_exceeded" || /quota/i.test(text)) {
-      const err = new TranscribeError(
-        `ElevenLabs credit quota exceeded. ${detail?.message || text.slice(0, 200)} ` +
-        "Everything transcribed so far is cached and will not re-bill. To finish: wait for your monthly credit reset (or upgrade the plan), then Reload. " +
-        "Tip: running Remove Silences or cutting retakes first shrinks the timeline audio that still needs transcribing."
-      );
-      err.code = "quota_exceeded";
-      throw err;
-    }
-    if (resp.status === 401) {
+// Transcribe one wav locally with HyperFrames whisper (`hyperframes transcribe`,
+// whisper.cpp under the hood). `--dir` gets its own temp dir per call so concurrent
+// batches never collide on the fixed `transcript.json` name. Returns the same
+// { words: [{ type, text, start, end }] } shape callScribe used to; whisper has no
+// diarization, so speaker_id is simply absent (segments.js maps it to null).
+async function callWhisper(wavPath, { model, language } = {}) {
+  const outDir = mkdtempSync(join(tmpdir(), "ocwhisper-"));
+  const args = [
+    "-y", "hyperframes", "transcribe", wavPath,
+    "--json", "--dir", outDir, "--model", whisperModel(model),
+  ];
+  if (language) args.push("--language", language);
+  try {
+    await run(npxBin(), args);
+    const transcriptPath = join(outDir, "transcript.json");
+    if (!existsSync(transcriptPath)) {
       throw new TranscribeError(
-        `ElevenLabs rejected the API key (401). Update it in the panel's settings (gear icon > ElevenLabs) and make sure it has the speech_to_text permission scope. ${text.slice(0, 200)}`
+        `HyperFrames whisper produced no transcript at ${transcriptPath}. Is the "hyperframes" CLI reachable (npx) and whisper.cpp installed?`
       );
     }
-    throw new TranscribeError(`ElevenLabs Scribe returned ${resp.status}: ${text.slice(0, 400)}`);
+    const raw = JSON.parse(readFileSync(transcriptPath, "utf8"));
+    const words = (Array.isArray(raw) ? raw : []).map((w) => ({
+      type: "word",
+      text: w.text || "",
+      start: w.start,
+      end: w.end != null ? w.end : w.start,
+    }));
+    return { words };
+  } finally {
+    try { rmSync(outDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
-  return resp.json();
 }
 
 function cacheKey(mediaPath) {
@@ -320,16 +331,10 @@ function cacheKey(mediaPath) {
  * (the pre-ranged cache format) if one is already cached.
  */
 export async function transcribeSourceRanges(mediaPath, ranges, opts = {}) {
-  const { cacheDir, model, language, numSpeakers, refresh = false } = opts;
+  const { cacheDir, model, language, refresh = false } = opts;
   // Progress messages ("Transcribing: 42% (3/8 parts done)") for the panel status line;
   // a throwing callback must never kill a transcription that's billing credits.
   const onProgress = (msg) => { if (opts.onProgress) { try { opts.onProgress(msg); } catch { /* ignore */ } } };
-  const apiKey = liveEnv("ELEVENLABS_API_KEY");
-  if (!apiKey) {
-    throw new TranscribeError(
-      "ELEVENLABS_API_KEY is not set. Add your ElevenLabs API key in the panel's settings (gear icon > ElevenLabs), or in the project .env, then retry."
-    );
-  }
   if (!existsSync(mediaPath)) {
     throw new TranscribeError(`Source media not found on disk: ${mediaPath}`);
   }
@@ -397,23 +402,23 @@ export async function transcribeSourceRanges(mediaPath, ranges, opts = {}) {
     onProgress(`Transcribing: ${pct}% (${doneBatches}/${batches.length} parts done)`);
   };
 
-  const recordBilled = (billedSec) =>
+  const recordTranscribed = (sec) =>
     recordUsage({
       type: "transcription",
-      model: scribeModel(model),
+      model: whisperModel(model),
       media: basename(mediaPath),
-      seconds: r3(billedSec),
-      costUsd: (billedSec / 3600) * scribeRatePerHourUsd(),
+      seconds: r3(sec),
+      costUsd: 0, // local whisper — no per-minute bill
     });
-  // Persist the union cache after EVERY successful Scribe call: if a later call fails
-  // (quota, network), the work already billed survives and the retry only pays for
-  // what's still uncovered.
+  // Persist the union cache after EVERY successful whisper call: if a later call fails
+  // (a crash, a killed process), the work already done survives and the retry only
+  // transcribes what's still uncovered.
   const commit = (batchIslands, srcWords) => {
     words = mergeWords(words, srcWords);
     islands = mergeIntervals([...islands, ...batchIslands], { mergeGapSec: 0, padSec: 0 });
-    writeFileSync(rangedPath, JSON.stringify({ model: scribeModel(model), islands, words }, null, 2));
+    writeFileSync(rangedPath, JSON.stringify({ model: whisperModel(model), islands, words }, null, 2));
   };
-  const scribeOpts = { model, language, numSpeakers };
+  const whisperOpts = { model, language };
   let tmpSeq = 0;
   const tmpName = () => join(tmpdir(), `editagent-${Date.now()}-${process.pid}-${++tmpSeq}.wav`);
 
@@ -422,10 +427,10 @@ export async function transcribeSourceRanges(mediaPath, ranges, opts = {}) {
   const transcribeOne = async (isl) => {
     const tmpWav = tmpName();
     try {
-      log(`transcribing via Scribe [${isl.start.toFixed(1)}-${isl.end.toFixed(1)}s]: ${basename(mediaPath)}`);
+      log(`transcribing via whisper [${isl.start.toFixed(1)}-${isl.end.toFixed(1)}s]: ${basename(mediaPath)}`);
       await extractAudioRange(mediaPath, isl.start, isl.end, tmpWav);
-      const payload = await callScribe(tmpWav, apiKey, scribeOpts);
-      recordBilled(isl.end - isl.start);
+      const payload = await callWhisper(tmpWav, whisperOpts);
+      recordTranscribed(isl.end - isl.start);
       commit([isl], offsetWords(payload.words || [], isl.start));
     } finally {
       try { rmSync(tmpWav, { force: true }); } catch { /* ignore */ }
@@ -472,17 +477,19 @@ export async function transcribeSourceRanges(mediaPath, ranges, opts = {}) {
         for (const isl of batch) await transcribeOne(isl);
         return;
       }
-      log(`transcribing via Scribe (${batch.length} ranges, one call): ${basename(mediaPath)}`);
-      const payload = await callScribe(tmpWav, apiKey, scribeOpts);
-      recordBilled(totalSec);
+      log(`transcribing via whisper (${batch.length} ranges, one call): ${basename(mediaPath)}`);
+      const payload = await callWhisper(tmpWav, whisperOpts);
+      recordTranscribed(totalSec);
       commit(batch, remapConcatWords(payload.words || [], layout));
     } finally {
       try { rmSync(tmpWav, { force: true }); } catch { /* ignore */ }
     }
   };
 
-  // Run batches through a small concurrent pool: ElevenLabs transcribes them in parallel,
-  // so wall clock is roughly the slowest part instead of the sum. On the first error no
+  // Run batches through a small concurrent pool: this overlaps ffmpeg extraction with
+  // whisper on other batches (whisper.cpp is itself multi-threaded, so keep the pool
+  // small — EDITAGENT_TRANSCRIBE_CONCURRENCY, default 3 — to avoid oversubscribing the
+  // CPU). On the first error no
   // NEW batch starts (in-flight ones settle); completed batches are already committed to
   // the cache, so a retry after quota reset only pays for what's still missing.
   if (batches.length) {

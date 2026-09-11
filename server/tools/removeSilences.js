@@ -102,23 +102,10 @@ export default {
 
     // Batched razor→lift→close (see applyRangesBatched) — one ripple per range
     // was O(ranges × clips) and took ~30 min on a 2h timeline.
-    const res = await applyRangesBatched(ctx, ranges, { ripple: true, fps: seq.frameRate, timeline });
+    const res = await applyRangesBatched(ctx, ranges, { ripple: true, fps: seq.frameRate });
     const appliedCount = res.applied;
     const errors = res.errors;
     const revision = bumpRevision(ctx);
-    if (res.rebuild) {
-      return {
-        revision,
-        applied: true,
-        rebuild: true,
-        sequenceName: res.sequenceName,
-        cuts: appliedCount,
-        totalRemovedSeconds: totalRemoved,
-        skipped,
-        note: `Created tightened sequence "${res.sequenceName}" with ${appliedCount} cuts removed. Original sequence untouched — delete the new one to discard.`,
-      };
-    }
-
     return {
       revision,
       applied: true,

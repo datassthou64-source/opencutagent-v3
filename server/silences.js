@@ -6,13 +6,8 @@
 // Loudness is measured from the source media (ffmpeg, no transcription). The
 // panel computes the red "Silence" ranges live in JS as the user drags the
 // controls; the server maps the final ranges to exact timeline frames (BigInt)
-// and applies them via the fast-apply ladder in applyRangesBatched (XML
-// round-trip / generated rebuild for big ripple applies, else the batched
-// razor-lift-close host ops).
+// and applies them in place via the batched razor-lift-close host ops.
 import { getTimeline, round3, ToolError, isAborted, callHostHealing } from "./tools/util.js";
-import { rebuildViaXml } from "./rebuild.js";
-import { roundtripViaXml } from "./roundtrip.js";
-import { liveEnv } from "./config.js";
 import { getLevels, sliceEnvelope } from "./audio/levels.js";
 import { detectSilences, levelStats, DEFAULT_SETTINGS, PRESETS } from "./audio/silence.js";
 import { sourceRangeToTimelineFrames, formatTimecode } from "./transcription/timecode.js";
@@ -175,7 +170,9 @@ const MODE_RIPPLE = { remove: true, keepSpaces: false };
 /** Merge frame ranges into an ascending, non-overlapping list (host requires it). */
 export function mergeFrameRanges(frames) {
   const sorted = frames
-    .filter((f) => f && f.endFrame > f.startFrame)
+    .filter((f) => f && Number.isFinite(f.startFrame) && Number.isFinite(f.endFrame))
+    .map((f) => ({ ...f, startFrame: Math.round(f.startFrame), endFrame: Math.round(f.endFrame) }))
+    .filter((f) => f.endFrame > f.startFrame)
     .slice()
     .sort((a, b) => a.startFrame - b.startFrame);
   const merged = [];
@@ -189,18 +186,8 @@ export function mergeFrameRanges(frames) {
 
 const APPLY_CHUNK = 50;
 
-// How many ripple cuts justify the XML-rebuild path (import a tightened copy —
-// seconds) over in-place razoring (minutes at scale). Override: EDITAGENT_REBUILD_MIN
-// in .env; 0 disables the rebuild path entirely.
-const REBUILD_MIN_DEFAULT = 100;
-function rebuildMinRanges() {
-  const v = Number(liveEnv("EDITAGENT_REBUILD_MIN"));
-  if (Number.isFinite(v) && v >= 0) return v === 0 ? Infinity : v;
-  return REBUILD_MIN_DEFAULT;
-}
-
 /**
- * Fast batched delete, shared by the silence AND retake apply paths. The old
+ * Batched in-place delete, shared by the silence AND retake apply paths. The old
  * loop called removeRange once per range — one evalScript round-trip + a QE
  * razor pass + a RIPPLE delete each; the ripple shifts every downstream clip,
  * so N ranges cost O(N × clips) DOM work (~30 min on a 2h talking timeline).
@@ -208,42 +195,8 @@ function rebuildMinRanges() {
  * nothing shifts, so chunk order is free and cancel works between chunks), then
  * ONE closeRangeGaps pass when rippling (each surviving clip moves once).
  */
-export async function applyRangesBatched(ctx, frames, { ripple = true, fps = 30, chunkSize, timeline = null, rebuildMin, onProgress = () => {} } = {}) {
+export async function applyRangesBatched(ctx, frames, { ripple = true, fps = 30, chunkSize, onProgress = () => {} } = {}) {
   const merged = mergeFrameRanges(frames);
-
-  // Big ripple jobs: skip in-place razoring entirely — build the finished
-  // sequence as FCP7 XML and import it (TimeBolt-style; one native op).
-  // Preferred builder is the ROUND-TRIP (export the real sequence, edit timing
-  // only → effects/transforms/levels survive); fallback is the generated
-  // rebuild (bare clips, effects dropped); any failure falls through to razor.
-  // EDITAGENT_ROUNDTRIP=0 in .env skips the round-trip builder.
-  const min = rebuildMin != null ? rebuildMin : rebuildMinRanges();
-  if (ripple && timeline && merged.length >= min) {
-    const rt = String(liveEnv("EDITAGENT_ROUNDTRIP") || "").toLowerCase();
-    const roundtripOff = rt === "0" || rt === "false" || rt === "off";
-    const builders = roundtripOff
-      ? [["generated", rebuildViaXml]]
-      : [["round-trip", roundtripViaXml], ["generated", rebuildViaXml]];
-    for (const [label, build] of builders) {
-      try {
-        const r = await build(ctx, timeline, merged, { onProgress });
-        return {
-          applied: merged.length,
-          appliedSec: r.removedSec,
-          requested: merged.length,
-          aborted: false,
-          errors: [],
-          rebuild: true,
-          roundtrip: !!r.roundtrip,
-          sequenceName: r.sequenceName,
-          opened: r.opened,
-        };
-      } catch (e) {
-        log(`XML ${label} rebuild failed:`, e.message);
-      }
-    }
-    onProgress("Fast rebuild unavailable. Cutting in place…");
-  }
 
   const size = Math.max(1, Number(chunkSize) || APPLY_CHUNK);
   let applied = 0;
@@ -261,6 +214,15 @@ export async function applyRangesBatched(ctx, frames, { ripple = true, fps = 30,
         .filter((k) => Number.isInteger(k) && k >= 0 && k < chunk.length); // a malformed host reply must not corrupt the accounting
       applied += idxs.length;
       for (const k of idxs) appliedSec += (chunk[k].endFrame - chunk[k].startFrame) / fps;
+      // The host no longer swallows these. A clip Premiere refused to delete, or a
+      // piece whose razor landed off the requested frame, means that span is still
+      // on the timeline — say so instead of reporting a clean "applied N/N".
+      if (res && res.failed > 0) {
+        errors.push({ at: chunk[0].startFrame, error: `Premiere refused to delete ${res.failed} clip(s) in this batch.` });
+      }
+      if (res && res.straddling > 0) {
+        errors.push({ at: chunk[0].startFrame, error: `${res.straddling} clip(s) overlap a cut without matching it (an edit point sits inside the cut); those spans were left in place.` });
+      }
       processed.push(...chunk);
     } catch (e) {
       errors.push({ at: chunk[0].startFrame, error: e.message });
@@ -271,7 +233,13 @@ export async function applyRangesBatched(ctx, frames, { ripple = true, fps = 30,
   if (ripple && applied > 0) {
     onProgress("Closing the gaps…");
     try {
-      await callHostHealing(ctx, "closeRangeGaps", { ranges: processed }, { timeoutMs: 600000 });
+      const close = await callHostHealing(ctx, "closeRangeGaps", { ranges: processed }, { timeoutMs: 600000 });
+      if (close && (close.failed > 0 || close.misaligned > 0 || close.ok === false)) {
+        errors.push({
+          at: -1,
+          error: `Premiere could not place ${Number(close.failed || 0) + Number(close.misaligned || 0)} clip(s) on their exact frame after closing gaps.`,
+        });
+      }
     } catch (e) {
       errors.push({ at: -1, error: `close gaps: ${e.message}` });
     }
@@ -320,32 +288,12 @@ export async function applySilenceRanges(ctx, { ranges = [], mode = "remove", tr
       }
     }
   } else {
-    const res = await applyRangesBatched(ctx, frames, { ripple, fps: seq.frameRate, chunkSize, timeline, onProgress });
+    const res = await applyRangesBatched(ctx, frames, { ripple, fps: seq.frameRate, chunkSize, onProgress });
     applied = res.applied;
     appliedSec = res.appliedSec;
     aborted = res.aborted;
     requested = res.requested;
     errors = res.errors;
-    if (res.rebuild) {
-      // Original sequence untouched — no undo snapshot; the new sequence IS the result.
-      ctx.state.revision += 1;
-      return {
-        applied,
-        requested,
-        removedSeconds: round3(appliedSec),
-        mode,
-        ripple,
-        transition,
-        aborted: false,
-        rebuild: true,
-        sequenceName: res.sequenceName,
-        undoable: false,
-        revision: ctx.state.revision,
-        message:
-          `Created tightened sequence "${res.sequenceName}"${res.opened ? " (now open)" : ""}. Removed ${applied} silence range(s), ~${round3(appliedSec)}s. ` +
-          `The original sequence is untouched; delete the new one to discard.`,
-      };
-    }
   }
   const removedSeconds = round3(appliedSec);
   if (applied > 0) {

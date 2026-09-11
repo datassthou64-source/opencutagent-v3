@@ -1,7 +1,10 @@
 import { WebSocketServer } from "ws";
 import { randomUUID } from "node:crypto";
 import { writeFileSync, unlinkSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { log } from "./log.js";
+
+const HOST_JSX = fileURLToPath(new URL("../cep-panel/host/premiere.jsx", import.meta.url));
 
 /**
  * PremiereBridge — hosts a localhost WebSocket listener that the CEP panel
@@ -202,6 +205,7 @@ export class PremiereBridge {
     }
     if (msg && msg.type === "hello") {
       log("panel hello:", msg.app || "", msg.version || "");
+      this._reloadHostScript();
       return;
     }
     if (msg && msg.type === "rpc") {
@@ -217,6 +221,20 @@ export class PremiereBridge {
     } else {
       p.reject(new BridgeError("HOST_ERROR", msg.error || "Unknown error inside Premiere (ExtendScript)."));
     }
+  }
+
+  /**
+   * Push the repo's premiere.jsx into Premiere's live ExtendScript engine the
+   * moment the panel connects. Reopening the panel does NOT reliably re-eval
+   * ScriptPath, so a host-side fix could sit on disk while Premiere kept running
+   * the old code (that is how "removed 0/N, nothing changed" happened). Doing it
+   * on hello makes "reopen the panel" a real reload. Best-effort: an old host
+   * that somehow lacks runScript just keeps what it has.
+   */
+  _reloadHostScript() {
+    this.callHost("runScript", { jsx: `$.evalFile(${JSON.stringify(HOST_JSX)}); "reloaded"` }, { timeoutMs: 15000 })
+      .then(() => log("host script reloaded into Premiere"))
+      .catch((e) => log("host script reload skipped:", e.message));
   }
 
   _handleRpc(msg) {

@@ -5,13 +5,19 @@ import { getTimeline, round3, isAborted } from "./tools/util.js";
 import { liveEnv } from "./config.js";
 import { transcribeSourceRanges } from "./transcription/transcribe.js";
 import { groupIntoPhrases, sliceWordsToWindow } from "./transcription/segments.js";
-import { sourceRangeToTimelineFrames } from "./transcription/timecode.js";
+import { sourceRangeToTimelineFrames, sourceSecToTimeline, timelineFrameToSourceTicks } from "./transcription/timecode.js";
 import { captureUndo } from "./undo.js";
 import { applyRangesBatched } from "./silences.js";
+import { buildRetakeV2Document } from "./retake-v2.js";
 
 // A clip is split into phrases on an internal pause >= this (sub-clip false
-// starts the silence pass didn't separate still get their own segment).
-const PHRASE_GAP_SEC = 0.5;
+// starts the silence pass didn't separate still get their own segment). To give
+// retake keep/cut finer control, a phrase is ALSO split at sentence boundaries
+// (whisper punctuation) and a long unbroken run is capped — so each segment is
+// roughly one sentence. All three are env-tunable (see .env.example).
+const PHRASE_GAP_SEC = Number(liveEnv("EDITAGENT_PHRASE_GAP_SEC")) || 0.5;
+const PHRASE_MAX_WORDS = Number(liveEnv("EDITAGENT_PHRASE_MAX_WORDS")) || 14;
+const SPLIT_ON_SENTENCE = liveEnv("EDITAGENT_PHRASE_SPLIT_SENTENCE") !== "0";
 // Segments shorter than this that DO contain speech are flagged (not auto-cut) —
 // they may be a real short word ("Yes.") or a clipped false start.
 const MIN_FRAGMENT_SEC = 0.5;
@@ -102,6 +108,7 @@ export async function buildReview(ctx, opts = {}, onProgress = () => {}) {
 
   const segments = [];
   const skipped = [];
+  const clipWordEntries = [];
   // Transcribe ONLY the source audio that's on the timeline: gather each source's used
   // clip windows first, so a source is sent to Scribe as its union of used ranges (merged
   // into a few islands) — never the whole file, never the off-timeline / silence-removed
@@ -128,7 +135,8 @@ export async function buildReview(ctx, opts = {}, onProgress = () => {}) {
     // Slice the source words to THIS clip's window, then phrase within the clip
     // so a segment never spans a cut the silence pass already made.
     const clipWords = sliceWordsToWindow(wordsByMedia.get(clip.mediaPath), clip.sourceIn.seconds, clip.sourceOut.seconds);
-    const phrases = groupIntoPhrases(clipWords, PHRASE_GAP_SEC);
+    clipWordEntries.push({ clip, words: clipWords });
+    const phrases = groupIntoPhrases(clipWords, PHRASE_GAP_SEC, { splitOnSentence: SPLIT_ON_SENTENCE, maxWords: PHRASE_MAX_WORDS });
     for (const part of partitionClip(clip, phrases)) {
       const r = sourceRangeToTimelineFrames(part.start, part.end, clip, seq.timebase);
       if (!r || r.endFrame - r.startFrame < 1) continue;
@@ -140,6 +148,11 @@ export async function buildReview(ctx, opts = {}, onProgress = () => {}) {
         mediaPath: clip.mediaPath,
         sourceInSec: round3(part.start),
         sourceOutSec: round3(part.end),
+        // Exact source boundaries corresponding to the snapped sequence frames.
+        // Re-insert uses these instead of rebuilding a source point from rounded
+        // transcript seconds.
+        sourceInTicks: timelineFrameToSourceTicks(r.startFrame, clip, seq.timebase),
+        sourceOutTicks: timelineFrameToSourceTicks(r.endFrame, clip, seq.timebase),
         // Speech extent inside the tile (source seconds) — null for no-speech
         // segments. Drives the "Remove excess" trim on apply.
         sourceSpeechInSec: part.speechStart != null ? round3(part.speechStart) : null,
@@ -167,7 +180,21 @@ export async function buildReview(ctx, opts = {}, onProgress = () => {}) {
   segments.forEach((s, i) => (s.index = i));
   const fragments = classifyFragments(segments, opts);
 
-  ctx.review = { sequence: seq.name, frameRate: seq.frameRate, dropFrame: seq.dropFrame, segments, skipped, fragments };
+  // Retakes Classic consumes the phrase tiles above. Retake V2 consumes this
+  // parallel word document, preserving every audible token and its source time.
+  const document = buildRetakeV2Document(clipWordEntries, seq);
+  ctx.reviewVersion = (ctx.reviewVersion || 0) + 1;
+  ctx.review = {
+    reviewId: `${seq.name}:${ctx.reviewVersion}`,
+    sequence: seq.name,
+    frameRate: seq.frameRate,
+    dropFrame: seq.dropFrame,
+    segments,
+    words: document.words,
+    sentences: document.sentences,
+    skipped,
+    fragments,
+  };
   return ctx.review;
 }
 
@@ -211,8 +238,17 @@ export async function reconcile(ctx, timeline = null) {
     liveByMedia.get(key).push(c);
   }
 
+  const timebase = timeline.sequence && timeline.sequence.timebase;
+
   const map = review.segments.map((s) => {
-    const out = { index: s.index, state: "absent", liveStartSec: null, liveEndSec: null };
+    const out = {
+      index: s.index, state: "absent", liveStartSec: null, liveEndSec: null,
+      // Exact (integer-tick) timeline frames for the same span. Seconds are what the
+      // panel draws with; FRAMES are what an apply razors at, and they must not go
+      // through a float round-trip — see the tick note where they're computed below.
+      liveStartFrame: null, liveEndFrame: null,
+      clipStartTicks: null, clipSourceInTicks: null,
+    };
     if (s.mediaPath == null || s.sourceInSec == null || s.sourceOutSec == null) return out; // pre-source-range segment
     const inS = s.sourceInSec, outS = s.sourceOutSec;
     const candidates = (liveByMedia.get(normPath(s.mediaPath)) || []).filter(
@@ -242,11 +278,30 @@ export async function reconcile(ctx, timeline = null) {
       out.liveStartSec = round3(liveStart);
       out.liveEndSec = round3(liveEnd);
       out.state = best.contained ? "present" : "partial";
+      // Frames come from INTEGER TICKS, never from the rounded seconds above.
+      // liveStartSec is round3()'d (millisecond) and sits on top of sourceInSec,
+      // which buildReview also round3()'d — and sequence.frameRate is itself
+      // round3()'d in getTimeline (30.00003 -> 30.0). Feeding all that into
+      // Math.round(sec * fps) lands a cut a whole frame off often enough to
+      // collide with edit points a previous pass left behind. The silence tab has
+      // always used this tick path (sourceRangeToTimelineFrames); retakes now do too.
+      if (timebase && c.start && c.start.ticks != null && c.sourceIn && c.sourceIn.ticks != null) {
+        const clampFrame = (f) => {
+          if (c.start.frame == null || c.end.frame == null) return f;
+          return Math.max(c.start.frame, Math.min(f, c.end.frame));
+        };
+        out.liveStartFrame = clampFrame(sourceSecToTimeline(s0, c, timebase).frame);
+        out.liveEndFrame = clampFrame(sourceSecToTimeline(s1, c, timebase).frame);
+        // Kept so downstream pure helpers (computeExcessRanges) can map any source
+        // second on this clip to an exact frame without re-reading the timeline.
+        out.clipStartTicks = String(c.start.ticks);
+        out.clipSourceInTicks = String(c.sourceIn.ticks);
+      }
     }
     return out;
   });
 
-  return { map, timeline, revision: ctx.state.revision, frameRate: round3(fps) };
+  return { map, timeline, timebase, revision: ctx.state.revision, frameRate: round3(fps) };
 }
 
 /**
@@ -263,6 +318,25 @@ export function reinsertTarget(segments, map, index) {
     if (!m || m.state === "absent") continue;
     if (s.index > index && m.liveStartSec != null) return m.liveStartSec; // next present → insert before it
     if (s.index < index && m.liveEndSec != null) prev = m.liveEndSec;     // remember the latest present before it
+  }
+  return prev != null ? prev : 0;
+}
+
+/** Frame-exact counterpart used by the host re-insert edit. */
+export function reinsertTargetFrame(segments, map, index, fps = 30) {
+  const byIndex = new Map(map.map((m) => [m.index, m]));
+  let prev = null;
+  for (const s of segments) {
+    const m = byIndex.get(s.index);
+    if (!m || m.state === "absent") continue;
+    if (s.index > index) {
+      if (Number.isInteger(m.liveStartFrame)) return m.liveStartFrame;
+      if (m.liveStartSec != null) return Math.round(m.liveStartSec * fps);
+    }
+    if (s.index < index) {
+      if (Number.isInteger(m.liveEndFrame)) prev = m.liveEndFrame;
+      else if (m.liveEndSec != null) prev = Math.round(m.liveEndSec * fps);
+    }
   }
   return prev != null ? prev : 0;
 }
@@ -329,17 +403,29 @@ export function computeExcessRanges(segments, map, fps, opts = {}) {
     if (!(s.wordCount > 0) || s.sourceSpeechInSec == null || s.sourceSpeechOutSec == null) continue;
     const m = byIndex.get(s.index);
     if (!m || m.state !== "present" || m.liveStartSec == null || m.liveEndSec == null) continue;
-    const live = (srcSec) => m.liveStartSec + (srcSec - s.sourceInSec);
+    // Work in SOURCE seconds, then convert once — same integer-tick path the cut
+    // ranges use, so an excess trim can never land a frame off the segment it
+    // belongs to (a stray frame here is exactly what leaves an invisible gap).
+    const exact =
+      opts.timebase && m.clipStartTicks != null && m.clipSourceInTicks != null
+        ? { start: { ticks: m.clipStartTicks }, sourceIn: { ticks: m.clipSourceInTicks } }
+        : null;
+    const toFrame = (srcSec) =>
+      exact
+        ? sourceSecToTimeline(srcSec, exact, opts.timebase).frame
+        : Math.round((m.liveStartSec + (srcSec - s.sourceInSec)) * fps);
+    const loF = m.liveStartFrame != null ? m.liveStartFrame : toFrame(s.sourceInSec);
+    const hiF = m.liveEndFrame != null ? m.liveEndFrame : toFrame(s.sourceOutSec);
     const spans = [
-      [m.liveStartSec, live(s.sourceSpeechInSec - pad)], // dead air before the first word
-      [live(s.sourceSpeechOutSec + pad), m.liveEndSec], // dead air after the last word
+      [s.sourceInSec, s.sourceSpeechInSec - pad], // dead air before the first word
+      [s.sourceSpeechOutSec + pad, s.sourceOutSec], // dead air after the last word
     ];
     for (const [a, b] of spans) {
-      const lo = Math.max(a, m.liveStartSec);
-      const hi = Math.min(b, m.liveEndSec);
+      const lo = Math.max(a, s.sourceInSec);
+      const hi = Math.min(b, s.sourceOutSec);
       if (hi - lo < minSpan) continue;
-      const startFrame = Math.round(lo * fps);
-      const endFrame = Math.round(hi * fps);
+      const startFrame = Math.max(loF, toFrame(lo));
+      const endFrame = Math.min(hiF, toFrame(hi));
       if (endFrame > startFrame) out.push({ index: s.index, startFrame, endFrame, excess: true });
     }
   }
@@ -361,9 +447,19 @@ export function computeExcessRanges(segments, map, fps, opts = {}) {
 export async function applyReview(ctx, { removeGaps = false, trimExcess = false, chunkSize } = {}, onProgress = () => {}) {
   const review = requireReview(ctx);
   const ripple = removeGaps === true;
-  const { map, timeline } = await reconcile(ctx); // one host read; also the pre-apply snapshot
+  const { map, timeline, timebase } = await reconcile(ctx); // one host read; also the pre-apply snapshot
   const fps = (timeline.sequence && timeline.sequence.frameRate) || review.frameRate || 30;
   const byIndex = new Map(map.map((m) => [m.index, m]));
+  // Prefer the tick-exact frames reconcile computed; fall back to the seconds
+  // rounding only for a map that predates them (older tests / stored maps).
+  const liveFrames = (m) => {
+    if (!m) return null;
+    if (Number.isInteger(m.liveStartFrame) && Number.isInteger(m.liveEndFrame)) {
+      return { startFrame: m.liveStartFrame, endFrame: m.liveEndFrame };
+    }
+    if (m.liveStartSec == null || m.liveEndSec == null) return null;
+    return { startFrame: Math.round(m.liveStartSec * fps), endFrame: Math.round(m.liveEndSec * fps) };
+  };
 
   // Count the Cut marks that are ALREADY gone from the live timeline separately —
   // "requested 0 because everything was removed earlier" must never read as
@@ -374,14 +470,13 @@ export async function applyReview(ctx, { removeGaps = false, trimExcess = false,
   const cuts = marked
     .map((s) => {
       const m = byIndex.get(s.index);
-      const startFrame = m && m.liveStartSec != null ? Math.round(m.liveStartSec * fps) : 0;
-      const endFrame = m && m.liveEndSec != null ? Math.round(m.liveEndSec * fps) : 0;
-      if (!m || m.state === "absent" || m.liveStartSec == null || m.liveEndSec == null || !(endFrame > startFrame)) {
+      const fr = m && m.state !== "absent" ? liveFrames(m) : null;
+      if (!fr || !(fr.endFrame > fr.startFrame)) {
         alreadyGone += 1;
         alreadyGoneSec += s.durationSec || 0;
         return null;
       }
-      return { index: s.index, startFrame, endFrame };
+      return { index: s.index, startFrame: fr.startFrame, endFrame: fr.endFrame };
     })
     .filter(Boolean);
 
@@ -393,24 +488,22 @@ export async function applyReview(ctx, { removeGaps = false, trimExcess = false,
     excessCuts = computeExcessRanges(review.segments, map, fps, {
       padSec: Number.isFinite(envPad) ? envPad : undefined,
       minSpanSec: Number.isFinite(envMin) ? envMin : undefined,
+      timebase,
     });
   }
 
-  const res = await applyRangesBatched(ctx, cuts.concat(excessCuts), { ripple, fps, chunkSize, timeline, onProgress });
+  const res = await applyRangesBatched(ctx, cuts.concat(excessCuts), { ripple, fps, chunkSize, onProgress });
   const applied = res.applied;
   if (applied > 0) {
     ctx.state.revision += 1;
-    // XML rebuild leaves the original sequence untouched — nothing to snapshot.
-    if (timeline && !res.rebuild) captureUndo(ctx, "retake", timeline, { ripple, applied });
+    if (timeline) captureUndo(ctx, "retake", timeline, { ripple, applied });
   }
   return {
     applied,
     appliedSec: res.appliedSec,
     ripple,
     aborted: res.aborted,
-    rebuild: res.rebuild || undefined,
-    sequenceName: res.sequenceName,
-    undoable: applied > 0 && !!timeline && !res.rebuild,
+    undoable: applied > 0 && !!timeline,
     requested: res.requested,
     cutsMarked: marked.length,
     excessSpans: excessCuts.length,

@@ -4,7 +4,7 @@
    Premiere Pro panel, anchored by the OPENCUTAGENT "Ember" coral (#EC6A41).
 
    Single source of truth for the panel (index.html) AND the component gallery
-   (preview.html). Tokens first, then base, then components, then the two tabs.
+   (preview.html). Tokens first, then base, then components, then the tabs.
    Dark-mode rule of thumb: elevate with LIGHTNESS, not shadows.
    ========================================================================== */
 
@@ -268,6 +268,18 @@ button.danger-text:hover:not(:disabled) { background: var(--danger-bg); border-c
 .adv-body { display: flex; flex-direction: column; gap: var(--sp-3); }
 .adv-body[hidden] { display: none; }
 .adv-warn { color: var(--warning-text); }
+/* Segmented 3-way picker (Retake engine). One row of buttons, one active. */
+.seg { display: flex; gap: 2px; padding: 2px; background: var(--surface-1); border: 1px solid var(--border-default); border-radius: var(--r-md); }
+.seg-btn {
+  flex: 1; padding: var(--sp-2) var(--sp-1); border: 0; border-radius: var(--r-sm);
+  background: transparent; color: var(--text-secondary);
+  font: inherit; font-size: var(--fs-sm); font-weight: 600; cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.seg-btn:hover:not(.active) { background: var(--surface-3); color: var(--text-primary); }
+.seg-btn.active { background: var(--accent); color: var(--text-on-accent); }
+.seg-btn:disabled { color: var(--text-disabled); cursor: default; background: transparent; }
+
 .adv-list { display: flex; flex-direction: column; gap: var(--sp-3); }
 .adv-var { display: flex; flex-direction: column; gap: var(--sp-1); }
 .adv-var .adv-key { color: var(--text-secondary); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em; word-break: break-all; }
@@ -655,6 +667,67 @@ button.reinsert:hover:not(:disabled) { background: var(--accent-hover); border-c
 /* Soft Apply (secondary) sits left of Apply All (the single primary), equal width */
 .footer .apply-row { display: flex; gap: var(--sp-2); }
 .footer .apply-row button { flex: 1; }
+
+/* ============================================================================
+   TAB 3 — RETAKE V2 (word-level document review)
+   ========================================================================== */
+.v2-toolbar { display: flex; gap: var(--sp-2); padding: var(--sp-3); flex: none; }
+.v2-toolbar button { flex: 1; }
+.v2-statusrow { padding-bottom: var(--sp-2); }
+
+.v2-selectionbar {
+  flex: none; display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3); color: var(--text-secondary); font-size: var(--fs-sm);
+  background: var(--accent-bg); border-top: 1px solid var(--accent-border); border-bottom: 1px solid var(--accent-border);
+}
+.v2-selectionbar[hidden] { display: none !important; }
+.v2-selection-actions { display: flex; gap: var(--sp-1); }
+.v2-selection-actions button { min-height: 25px; padding: 2px var(--sp-2); }
+
+.v2-document {
+  flex: 1; min-height: 0; overflow-y: auto; padding: var(--sp-4) var(--sp-3) var(--sp-6);
+  background: #1d1a18; border-top: 1px solid var(--border-subtle); user-select: none;
+}
+.v2-page {
+  max-width: 760px; margin: 0 auto; padding: var(--sp-4) var(--sp-3) var(--sp-6);
+  background: var(--surface-1); border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+}
+.v2-sentence {
+  display: grid; grid-template-columns: 45px minmax(0, 1fr); gap: var(--sp-2);
+  padding: 2px var(--sp-2); border-radius: var(--r-sm); transition: background var(--dur-fast) var(--ease);
+}
+.v2-sentence + .v2-sentence { margin-top: 2px; }
+.v2-sentence.current { background: var(--accent-bg); box-shadow: inset 2px 0 0 var(--accent); }
+.v2-time {
+  padding-top: 3px; color: var(--text-tertiary); font-size: var(--fs-xs); cursor: pointer;
+  font-variant-numeric: tabular-nums; text-align: right;
+}
+.v2-time:hover { color: var(--accent-text); }
+.v2-prose { min-width: 0; color: var(--text-primary); font-size: var(--fs-md); line-height: 1.85; }
+.v2-word {
+  display: inline; border-radius: 3px; padding: 2px 1px; margin: 0 1px 0 0;
+  cursor: text; transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+}
+.v2-word:hover { background: var(--surface-3); }
+.v2-word.selected { background: rgba(90, 140, 255, 0.32); box-shadow: inset 0 -1px 0 #8db0ff; }
+.v2-word.cut { color: #ffd4d1; background: rgba(225, 75, 75, 0.38); text-decoration: line-through; text-decoration-color: rgba(255, 212, 209, 0.55); }
+.v2-word.cut:hover { background: rgba(225, 75, 75, 0.54); }
+.v2-word.suggested { box-shadow: inset 0 -1px 0 rgba(240, 135, 132, 0.8); }
+.v2-word.current { color: var(--text-on-accent); background: var(--accent); text-decoration: none; box-shadow: 0 0 0 2px rgba(236, 106, 65, 0.28); }
+.v2-word.absent { opacity: 0.45; font-style: italic; }
+.v2-event { color: var(--text-tertiary); font-style: italic; }
+
+.v2-footer { gap: var(--sp-2); }
+.v2-footer #v2ApplyBtn { width: 100%; min-height: 38px; font-size: var(--fs-md); font-weight: 700; }
+.v2-help { color: var(--text-tertiary); font-size: var(--fs-xs); line-height: 1.45; }
+
+@media (max-width: 390px) {
+  .tab { gap: var(--sp-1); font-size: var(--fs-sm); padding-left: var(--sp-1); padding-right: var(--sp-1); }
+  .tab .ic { display: none; }
+  .v2-selectionbar { align-items: flex-start; flex-direction: column; }
+  .v2-selection-actions { width: 100%; }
+  .v2-selection-actions button { flex: 1; }
+}
 
 /* ============================ A11Y / MOTION ============================ */
 @media (prefers-reduced-motion: reduce) {

@@ -102,9 +102,49 @@ check("stale host: hot-patches via runScript $.evalFile", healCalls.some((c) => 
 check("stale host: retries and applies 2", rH.applied === 2, rH);
 check("stale host: no errors surfaced after heal", !rH.errors, rH);
 
+// --- host reports a delete it could not make: never report a clean apply ---
+{
+  const calls = [];
+  const ctxF = {
+    calls,
+    bridge: {
+      callHost: async (action, params) => {
+        if (action === "getTimelineState") return RAW_TIMELINE;
+        calls.push({ action, ...params });
+        // one clip Premiere refused + one piece whose razor missed the range
+        if (action === "removeRangesBatch") return { ok: true, removedIndexes: [0], failed: 1, straddling: 2 };
+        return { ok: true };
+      },
+      notifyPanel: () => {},
+    },
+    state: { revision: 0 },
+    cacheDir: "/tmp",
+  };
+  const rF = await applySilenceRanges(ctxF, { ranges, mode: "remove" });
+  check("failed deletes surface as an error", !!rF.errors && rF.errors.some((e) => /refused to delete 1 clip/.test(e.error)), rF.errors);
+  check("straddling pieces surface as an error", !!rF.errors && rF.errors.some((e) => /2 clip\(s\) overlap a cut/.test(e.error)), rF.errors);
+  check("applied still counts only what the host confirmed", rF.applied === 1, rF);
+}
+
 // --- mergeFrameRanges: overlaps/adjacent merge, ascending ---
 const mm = mergeFrameRanges([{ startFrame: 100, endFrame: 200 }, { startFrame: 50, endFrame: 120 }, { startFrame: 300, endFrame: 310 }, { startFrame: 310, endFrame: 300 }]);
 check("mergeFrameRanges merges overlaps + drops invalid", mm.length === 2 && mm[0].startFrame === 50 && mm[0].endFrame === 200 && mm[1].startFrame === 300, mm);
+const qm = mergeFrameRanges([{ startFrame: 10.49, endFrame: 20.51 }, { startFrame: NaN, endFrame: 30 }]);
+check("mergeFrameRanges quantizes every boundary to integer frames", qm.length === 1 && qm[0].startFrame === 10 && qm[0].endFrame === 21, qm);
+
+// --- a failed/misaligned post-ripple placement is surfaced to the caller ---
+{
+  const ctxA = makeCtx();
+  ctxA.bridge.callHost = async (action, params) => {
+    if (action === "getTimelineState") return RAW_TIMELINE;
+    ctxA.calls.push({ action, ...params });
+    if (action === "removeRangesBatch") return { ok: true, removedIndexes: [0, 1] };
+    if (action === "closeRangeGaps") return { ok: false, moved: 1, failed: 1, misaligned: 1 };
+    return { ok: true };
+  };
+  const rA = await applySilenceRanges(ctxA, { ranges, mode: "remove" });
+  check("post-ripple frame-placement failures surface as errors", !!rA.errors && rA.errors.some((e) => /2 clip\(s\).*exact frame/.test(e.error)), rA.errors);
+}
 
 // --- mute → muteRange ---
 const ctx3 = makeCtx();

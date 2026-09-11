@@ -1,5 +1,5 @@
 /*
- * main.js — OpenCutAgent panel (two tabs).
+ * main.js — OpenCutAgent panel (silence, Retakes Classic, and word-level V2).
  *
  * Channels over one WebSocket to the MCP server:
  *  - host ops   (server -> panel): {requestId, action, params}  -> run in premiere.jsx
@@ -193,18 +193,20 @@
       updateAllButtons();
       // Ask the server whether a prior apply is still undoable (survives reloads).
       callServer("undoStatus", {}).then(function (r) {
-        if (r && r.undoable) { Silence.markUndoable(r.kind); Retake.markUndoable(r.kind); }
+        if (r && r.undoable) { Silence.markUndoable(r.kind); Retake.markUndoable(r.kind); RetakeV2.markUndoable(r.kind); }
       }, function () {});
       // Learn whether an ElevenLabs key is configured, so a transcription
       // attempt without one opens the key modal instead of failing.
       AI.refreshKey();
       if (activeTab === "retake") Retake.onShow(); // resume playhead sync after a reconnect
+      else if (activeTab === "retake-v2") RetakeV2.onShow();
       else if (activeTab === "silence") Silence.onShow();
     };
     ws.onmessage = handleMessage;
     ws.onclose = function () {
       failRpc("Disconnected from server.");
       Retake.onHide(); // stop the playhead poll while offline
+      RetakeV2.onHide();
       Silence.onHide();
       updateAllButtons();
       // The panel is just a client — if nothing is serving the port, start the
@@ -350,7 +352,7 @@
   }
   function failRpc(reason) { for (var id in pendingRpc) { try { pendingRpc[id].reject(new Error(reason)); } catch (e) {} } pendingRpc = {}; }
 
-  function updateAllButtons() { Retake.updateButtons(); Silence.updateButtons(); }
+  function updateAllButtons() { Retake.updateButtons(); RetakeV2.updateButtons(); Silence.updateButtons(); }
 
   /* ================================================================
    *  SETTINGS POPOVER — Claude (model/effort/sync) + storage (cache).
@@ -369,7 +371,7 @@
         st.sync = window.localStorage.getItem("editagent.ai.sync") === "1";
         st.model = window.localStorage.getItem("editagent.ai.model") || "latest";
         st.effort = window.localStorage.getItem("editagent.ai.effort") || "high";
-        st.sttModel = window.localStorage.getItem("editagent.sttModel") || "scribe_v2";
+        st.sttModel = window.localStorage.getItem("editagent.sttModel") || "small.en";
       } catch (e) {}
     }
     function persist() {
@@ -391,7 +393,7 @@
       el.aiEffort.value = st.effort;
       if (el.aiEffort.value !== st.effort) { st.effort = el.aiEffort.value || "high"; persist(); el.aiEffort.value = st.effort; }
       el.sttModel.value = st.sttModel;
-      if (el.sttModel.value !== st.sttModel) { st.sttModel = el.sttModel.value || "scribe_v2"; persist(); el.sttModel.value = st.sttModel; }
+      if (el.sttModel.value !== st.sttModel) { st.sttModel = el.sttModel.value || "small.en"; persist(); el.sttModel.value = st.sttModel; }
       el.aiCtls.className = "pop-group" + (st.sync ? " off" : ""); // model/effort irrelevant in sync mode
       if (el.aiHint) el.aiHint.textContent = st.sync
         ? "Paired with your Claude Code chat over MCP. Ask Claude to edit the timeline in chat (for example “cut the retakes”) and the results appear here for review."
@@ -553,7 +555,9 @@
     }
     // True when we KNOW no key is configured — callers open the modal instead
     // of letting the transcription fail with a dotfile error message.
-    function keyMissing() { return st.keySet === false; }
+    // Transcription is local now (HyperFrames whisper, no API key), so never gate on a
+    // missing ElevenLabs key. Kept as a stub so callers/gates stay wired.
+    function keyMissing() { return false; }
     // Recognize a missing/rejected-key failure from any RPC and turn it into the
     // modal. Returns true when handled so the caller can soften its own error UI.
     function handleKeyError(err) {
@@ -568,6 +572,59 @@
         return true;
       }
       return false;
+    }
+
+    /* ---- Retake engine picker (EDITAGENT_RETAKE_MODE) ----
+     * Which engine "Analyze w/ Claude" uses on the Retakes tab. It lives in .env
+     * (server/retakes/fast.js retakeMode() reads it) rather than panel state, so
+     * the MCP/chat path and the button agree on one setting. It is also the last
+     * row of the Advanced accordion; changing it here re-renders that if open. */
+    var RETAKE_MODES = {
+      fast: "Balanced local pass: compares both individual rows and short multi-row takes, catching repeated prefixes and lightly reworded retries. Lower-confidence matches stay Keep. Milliseconds, no Claude call, no tokens.",
+      hybrid: "The same local detection, then ONE small Claude call about the unclear groups only \u2014 roughly 1.5k tokens instead of 80-110k. Adds about 20-60s.",
+      ai: "Sends the whole timeline to Claude in ~12-24 windowed calls. The most accurate, and by far the slowest and most expensive (minutes; 80-110k output tokens on a long timeline)."
+    };
+    function reflectRetake(mode) {
+      if (!el.retakeSeg) return;
+      var btns = el.retakeSeg.querySelectorAll(".seg-btn");
+      for (var i = 0; i < btns.length; i++) {
+        var on = btns[i].getAttribute("data-mode") === mode;
+        btns[i].className = "seg-btn" + (on ? " active" : "");
+        btns[i].setAttribute("aria-checked", on ? "true" : "false");
+      }
+      el.retakeHint.textContent = RETAKE_MODES[mode] || "";
+    }
+    function refreshRetake() {
+      if (!el.retakeSeg) return;
+      if (!connected()) { el.retakeHint.textContent = "Server offline. The retake engine can be changed once the server is running."; return; }
+      callServer("envList", {}).then(
+        function (r) {
+          var vars = (r && r.vars) || [];
+          for (var i = 0; i < vars.length; i++) {
+            if (vars[i].key !== "EDITAGENT_RETAKE_MODE") continue;
+            // Empty value = the server's own default (fast).
+            st.retakeMode = (vars[i].value || vars[i].def || "fast").toLowerCase();
+            reflectRetake(st.retakeMode);
+            return;
+          }
+        },
+        function (err) { el.retakeHint.textContent = "Could not read the current setting: " + err.message; }
+      );
+    }
+    function setRetake(mode) {
+      if (!RETAKE_MODES[mode]) return;
+      if (mode === st.retakeMode) return;
+      if (!connected()) { toast("Server offline. The setting was not saved.", "error"); return; }
+      var prev = st.retakeMode;
+      st.retakeMode = mode;
+      reflectRetake(mode); // optimistic: the popover feels instant, revert on failure
+      callServer("setEnv", { key: "EDITAGENT_RETAKE_MODE", value: mode }).then(
+        function () {
+          toast("Retake engine set to " + (mode === "ai" ? "Full AI" : mode.charAt(0).toUpperCase() + mode.slice(1)) + ".", "success");
+          if (el.advBody && !el.advBody.hidden) refreshAdv(); // keep the raw field in sync
+        },
+        function (err) { st.retakeMode = prev; reflectRetake(prev); toast(err.message, "error"); }
+      );
     }
 
     /* ---- Advanced env-var accordion (collapsed by default) ---- */
@@ -614,7 +671,7 @@
       el.aiPop.hidden = false;
       el.aiConfigBtn.classList.add("active");
       el.aiConfigBtn.setAttribute("aria-expanded", "true");
-      resetClearBtn(); refreshCache(); refreshKey();
+      resetClearBtn(); refreshCache(); refreshKey(); refreshRetake();
       if (!el.advBody.hidden) refreshAdv();
     }
     function close() {
@@ -628,7 +685,7 @@
       ["syncToggle", "aiModel", "aiEffort", "sttModel", "aiCtls", "aiHint", "aiConfigBtn", "aiPop", "cacheSize", "clearCacheBtn",
        "usageBtn", "usageModal", "usageCloseBtn", "usageRows", "usageEmpty", "usageTotals",
        "keyState", "keyBtn", "keyModal", "keyCloseBtn", "keyReason", "keyInput", "keyError", "keySaveBtn",
-       "advToggle", "advBody", "advList"]
+       "advToggle", "advBody", "advList", "retakeSeg", "retakeHint"]
         .forEach(function (id) { el[id] = $(id); });
       load(); reflect();
       el.syncToggle.addEventListener("change", function () { st.sync = el.syncToggle.checked; persist(); reflect(); updateAllButtons(); });
@@ -646,6 +703,10 @@
       el.keyModal.addEventListener("click", function (e) { if (e.target === el.keyModal) closeKeyModal(); });
       el.keySaveBtn.addEventListener("click", saveKey);
       el.keyInput.addEventListener("keydown", function (e) { if (e.key === "Enter") saveKey(); });
+      el.retakeSeg.addEventListener("click", function (e) {
+        var btn = e.target && e.target.closest ? e.target.closest(".seg-btn") : null;
+        if (btn) setRetake(btn.getAttribute("data-mode"));
+      });
       el.advToggle.addEventListener("click", toggleAdv);
       // Advanced inputs save on blur or Enter (delegated — the list re-renders).
       el.advList.addEventListener("focusout", function (e) { if (e.target && e.target.getAttribute && e.target.getAttribute("data-envkey")) saveAdvInput(e.target); });
@@ -663,6 +724,10 @@
       wire: wire,
       sync: function () { return st.sync; },
       params: function () { return { model: st.model, effort: st.effort, transcribe_model: st.sttModel }; },
+      // Retake V2 has its own bounded AI-Lite contract. "Latest" becomes Sonnet
+      // and effort stays low so an old persisted High setting cannot recreate the
+      // 80k-110k-token Full AI runs. An explicitly selected model is still honored.
+      wordParams: function () { return { word_model: st.model === "latest" ? "sonnet" : st.model, word_effort: "low", transcribe_model: st.sttModel }; },
       sttModel: function () { return st.sttModel; },
       keyMissing: keyMissing,
       handleKeyError: handleKeyError,
@@ -687,10 +752,13 @@
     for (var i = 0; i < tabs.length; i++) tabs[i].className = "tab" + (tabs[i].getAttribute("data-tab") === name ? " active" : "");
     $("tab-silence").className = "tabpane" + (name === "silence" ? "" : " hidden");
     $("tab-retake").className = "tabpane" + (name === "retake" ? "" : " hidden");
+    $("tab-retake-v2").className = "tabpane" + (name === "retake-v2" ? "" : " hidden");
     if (prev === "retake" && name !== "retake") Retake.onHide();
+    if (prev === "retake-v2" && name !== "retake-v2") RetakeV2.onHide();
     if (prev === "silence" && name !== "silence") Silence.onHide();
     if (name === "silence") Silence.onShow();
     else if (name === "retake") Retake.onShow();
+    else if (name === "retake-v2") RetakeV2.onShow();
   }
   (function wireTabs() {
     var tabs = document.querySelectorAll(".tab");
@@ -1565,9 +1633,7 @@
     function setBusy(b) { state.busy = b; updateButtons(); }
 
     function loadSegments() {
-      // Transcription needs an ElevenLabs key — if we know there isn't one,
-      // open the key modal instead of letting the load fail with an .env error.
-      if (connected() && AI.keyMissing()) { AI.openKeyModal("Loading segments transcribes the timeline with ElevenLabs. Add your API key below, then click Load segments again."); return; }
+      // Transcription is local (HyperFrames whisper), so no API-key gate here.
       setBusy(true); setStatus("Loading…"); setLoading(el.loadBtn, true, "Loading…");
       el.segments.innerHTML = skeletonRows();
       callServer("loadSegments", { transcribe_model: AI.sttModel() }, function (m) { setStatus(m); }).then(
@@ -1600,16 +1666,27 @@
       }
       // Headless (default): Claude analyzes here and pushes the marks for review.
       if (!connected()) { setStatus("Not connected.", true); return; }
-      // Analyzing an unloaded timeline transcribes first, which needs the key.
-      if (!state.loaded && AI.keyMissing()) { AI.openKeyModal("Analyzing transcribes the timeline with ElevenLabs first. Add your API key below, then click Analyze again."); return; }
+      // Analyzing an unloaded timeline transcribes first, but that is local now (no key gate).
       setBusy(true); setStatus("Claude is analyzing the retakes…"); setLoading(el.aiBtn, true, "Analyzing…");
       callServer("aiRetakes", AI.params(), function (m) { setStatus(m); }).then(
         function (res) {
           setLoading(el.aiBtn, false, "Analyze w/ Claude"); setBusy(false);
           // The Keep/Cut marks themselves arrive via the reviewUpdate push (markDecisions).
           var cut = (res && res.cut != null) ? res.cut : 0;
-          setStatus("Claude marked " + cut + " segment(s) to cut. Review below, then Apply All.");
-          toast("Claude analyzed " + (res && res.analyzed != null ? res.analyzed : state.segments.length) + " segment(s) · " + cut + " to cut.", "success");
+          // How the retakes were found, so a slow or surprising run is diagnosable from
+          // the panel alone: hybrid/fast do the matching here and only escalate the
+          // unclear groups, "ai" is the old whole-timeline path.
+          var eng = (res && res.engine) || null;
+          var how = "";
+          if (eng && eng.mode === "fast") {
+            how = " (" + (eng.reviewGroups || 0) + " possible groups left untouched; " + eng.detectMs + "ms; no AI)";
+          } else if (eng && eng.mode !== "ai") {
+            how = eng.escalated
+              ? " (" + eng.groups + " groups found here in " + eng.detectMs + "ms, " + eng.escalated + " checked by Claude)"
+              : " (found here in " + eng.detectMs + "ms, no AI call needed)";
+          }
+          setStatus("Marked " + cut + " segment(s) to cut." + how + " Review below, then Apply All.");
+          toast("Analyzed " + (res && res.analyzed != null ? res.analyzed : state.segments.length) + " segment(s) · " + cut + " to cut.", "success");
         },
         function (err) {
           setLoading(el.aiBtn, false, "Analyze w/ Claude"); setBusy(false);
@@ -2023,14 +2100,344 @@
     return { wire: wire, updateButtons: updateButtons, applyReviewUpdate: applyReviewUpdate, setMap: setMap, markUndoable: markUndoable, clearUndoable: clearUndoable, onShow: onShow, onHide: onHide, refreshMap: refreshMap };
   })();
 
+  /* ================================================================
+   *  RETAKE V2 — continuous, word-level transcript review
+   * ================================================================ */
+  var RetakeV2 = (function () {
+    var state = {
+      words: [], sentences: [], suggestions: {}, reviewId: null, loaded: false, busy: false, undoAvailable: false,
+      liveMap: {}, follow: true, currentWord: null,
+      selectA: null, selectB: null, dragging: false, dragMoved: false,
+      pollTimer: null, pollInFlight: false, mapRefreshing: false,
+    };
+    var POLL_MS = 300;
+    var UNDO_LABEL = "Undo last apply";
+    var el = {};
+
+    function cache() {
+      ["v2LoadBtn", "v2AnalyzeBtn", "v2StopBtn", "v2Status", "v2Follow", "v2SelectionBar", "v2SelectionLabel", "v2KeepBtn", "v2CutBtn", "v2ClearSelectionBtn", "v2Document", "v2RemoveGaps", "v2UndoBtn", "v2ApplyBtn", "v2Summary"].forEach(function (id) { el[id] = $(id); });
+    }
+    function setStatus(text, isErr) { el.v2Status.textContent = text || ""; el.v2Status.className = "statusbar" + (isErr ? " err" : ""); }
+    function setBusy(b) { state.busy = b; updateButtons(); }
+    function loadFollow() { try { state.follow = window.localStorage.getItem("editagent.retakeV2.follow") !== "0"; } catch (e) { state.follow = true; } }
+    function persistFollow() { try { window.localStorage.setItem("editagent.retakeV2.follow", state.follow ? "1" : "0"); } catch (e) {} }
+    function wordByIndex(i) { return state.words[i] && state.words[i].index === i ? state.words[i] : null; }
+    function isAbsent(w) { var m = state.liveMap[w.index]; return !!(m && m.state === "absent"); }
+
+    function prepareWords(words) {
+      state.words = words || [];
+      for (var i = 0; i < state.words.length; i++) {
+        state.words[i].decision = "keep";
+        state.words[i].manual = false;
+        state.words[i].suggestionId = null;
+        state.words[i].reason = null;
+      }
+      state.suggestions = {};
+      state.selectA = state.selectB = null;
+    }
+
+    function loadTranscript() {
+      if (state.busy) return;
+      setBusy(true); setStatus("Loading the word-level transcript…"); setLoading(el.v2LoadBtn, true, "Loading…");
+      el.v2Document.innerHTML = skeletonRows();
+      callServer("loadRetakeV2", { transcribe_model: AI.sttModel() }, function (m) { setStatus(m); }).then(
+        function (res) {
+          prepareWords(res.words || []);
+          state.sentences = res.sentences || [];
+          state.reviewId = res.reviewId || null;
+          state.liveMap = {}; state.loaded = true;
+          setLoading(el.v2LoadBtn, false, "Reload"); setBusy(false);
+          setStatus(state.words.length + " words loaded in " + state.sentences.length + " sentences" + (res.skipped && res.skipped.length ? " (" + res.skipped.length + " clip(s) skipped)" : "") + ".");
+          render(); refreshMap();
+        },
+        function (err) {
+          setLoading(el.v2LoadBtn, false, state.loaded ? "Reload" : "Load transcript"); setBusy(false);
+          var cancelled = /cancel/i.test(err.message);
+          setStatus(cancelled ? "Stopped." : err.message, !cancelled); render();
+        }
+      );
+    }
+
+    function stop() { if (!state.busy) return; callServer("cancel", {}).catch(function () {}); setStatus("Stopping…"); }
+
+    function analyze() {
+      if (state.busy) return;
+      if (AI.sync()) {
+        toast("Retake V2 AI-Lite runs from this panel. Turn off Sync with Claude Code, then choose AI word cuts.");
+        return;
+      }
+      setBusy(true); setStatus("AI-Lite is reviewing the full transcript…"); setLoading(el.v2AnalyzeBtn, true, "Analyzing…");
+      callServer("aiRetakesV2", AI.wordParams(), function (m) { setStatus(m); }).then(
+        function (res) {
+          if (!state.loaded || !state.words.length || state.reviewId !== res.reviewId) {
+            prepareWords(res.words || []); state.sentences = res.sentences || []; state.loaded = true;
+          }
+          state.reviewId = res.reviewId || state.reviewId;
+          applySuggestions(res.suggestions || []);
+          setLoading(el.v2AnalyzeBtn, false, "AI word cuts"); setBusy(false); render(); refreshMap();
+          var calls = res.engine && res.engine.calls != null ? " across " + res.engine.calls + " AI call(s)" : "";
+          setStatus((res.suggestions || []).length + " exact word removal(s)" + calls + ". Click red text to reject one, or drag to refine.");
+          toast((res.suggestions || []).length + " AI-Lite word suggestion(s) ready to review.", "success");
+        },
+        function (err) {
+          setLoading(el.v2AnalyzeBtn, false, "AI word cuts"); setBusy(false);
+          var cancelled = /cancel/i.test(err.message);
+          setStatus(cancelled ? "AI cancelled." : err.message, !cancelled);
+        }
+      );
+    }
+
+    function applySuggestions(suggestions) {
+      state.suggestions = {};
+      for (var i = 0; i < state.words.length; i++) {
+        if (!state.words[i].manual) state.words[i].decision = "keep";
+        state.words[i].suggestionId = null; state.words[i].reason = null;
+      }
+      for (var s = 0; s < suggestions.length; s++) {
+        var sug = suggestions[s];
+        state.suggestions[sug.id] = { id: sug.id, accepted: sug.accepted !== false, reason: sug.reason || "duplicate take" };
+        for (var j = sug.startWord; j <= sug.endWord; j++) {
+          var w = wordByIndex(j); if (!w || w.manual) continue;
+          w.suggestionId = sug.id; w.reason = sug.reason || "duplicate take";
+          w.decision = state.suggestions[sug.id].accepted ? "cut" : "keep";
+        }
+      }
+    }
+
+    function toggleSuggestion(id) {
+      var sug = state.suggestions[id]; if (!sug) return;
+      sug.accepted = !sug.accepted;
+      for (var i = 0; i < state.words.length; i++) {
+        var w = state.words[i];
+        if (String(w.suggestionId) === String(id) && !w.manual) w.decision = sug.accepted ? "cut" : "keep";
+      }
+      setStatus((sug.accepted ? "Accepted" : "Rejected") + " suggestion: " + sug.reason + ".");
+      render();
+    }
+
+    function selectionBounds() {
+      if (state.selectA == null || state.selectB == null) return null;
+      return { a: Math.min(state.selectA, state.selectB), b: Math.max(state.selectA, state.selectB) };
+    }
+    function paintSelection() {
+      var b = selectionBounds();
+      var nodes = el.v2Document.querySelectorAll(".v2-word");
+      for (var i = 0; i < nodes.length; i++) {
+        var n = Number(nodes[i].getAttribute("data-word"));
+        if (b && n >= b.a && n <= b.b) nodes[i].classList.add("selected"); else nodes[i].classList.remove("selected");
+      }
+      var count = b ? b.b - b.a + 1 : 0;
+      el.v2SelectionBar.hidden = !count;
+      el.v2SelectionLabel.textContent = count + (count === 1 ? " word selected" : " words selected");
+    }
+    function clearSelection() { state.selectA = state.selectB = null; paintSelection(); }
+    function markSelection(decision) {
+      var b = selectionBounds(); if (!b) return;
+      for (var i = b.a; i <= b.b; i++) {
+        var w = wordByIndex(i); if (!w) continue;
+        w.decision = decision; w.manual = true; w.suggestionId = null; w.reason = decision === "cut" ? "manual word selection" : null;
+      }
+      clearSelection(); render();
+      setStatus((decision === "cut" ? "Marked" : "Kept") + " words " + (b.a + 1) + "–" + (b.b + 1) + ".");
+    }
+
+    function cutRanges() {
+      var out = [], i = 0;
+      while (i < state.words.length) {
+        if (state.words[i].decision !== "cut") { i++; continue; }
+        var a = i, key = state.words[i].clipKey;
+        while (i + 1 < state.words.length && state.words[i + 1].decision === "cut" && state.words[i + 1].clipKey === key) i++;
+        out.push({ startWord: a, endWord: i }); i++;
+      }
+      return out;
+    }
+
+    function applyCuts() {
+      var ranges = cutRanges();
+      if (!ranges.length) { toast("No words are marked Cut."); return; }
+      setBusy(true); setStatus("Reconciling word ranges against the live timeline…"); setLoading(el.v2ApplyBtn, true, "Applying…");
+      callServer("applyRetakeV2Ranges", { reviewId: state.reviewId, ranges: ranges, removeGaps: el.v2RemoveGaps.checked }, function (m) { setStatus(m); }).then(
+        function (res) {
+          if (res.undoable) { state.undoAvailable = true; Silence.clearUndoable(); Retake.clearUndoable(); }
+          setLoading(el.v2ApplyBtn, false, "Apply Selected Cuts"); setBusy(false);
+          setStatus(res.message || "Applied."); toast(res.message || "Applied word cuts.", res.applied ? "success" : "info");
+          refreshMap();
+        },
+        function (err) {
+          setLoading(el.v2ApplyBtn, false, "Apply Selected Cuts"); setBusy(false);
+          var cancelled = /cancel/i.test(err.message); setStatus(cancelled ? "Stopped." : err.message, !cancelled);
+        }
+      );
+    }
+
+    function undo() {
+      if (!state.undoAvailable || state.busy) return;
+      setBusy(true); setStatus("Reverting the timeline…"); setLoading(el.v2UndoBtn, true, "Undoing…");
+      callServer("undoLastApply", {}, function (m) { setStatus(m); }).then(
+        function (res) {
+          setLoading(el.v2UndoBtn, false, UNDO_LABEL); setBusy(false);
+          if (res.ok) { state.undoAvailable = false; Silence.clearUndoable(); Retake.clearUndoable(); toast(res.message, "success"); setStatus(res.message); loadTranscript(); }
+          else { toast(res.message, "error"); setStatus(res.message, true); }
+        },
+        function (err) { setLoading(el.v2UndoBtn, false, UNDO_LABEL); setBusy(false); setStatus(err.message, true); }
+      );
+    }
+
+    function setMap(arr) {
+      var map = {};
+      for (var i = 0; arr && i < arr.length; i++) map[arr[i].index] = { state: arr[i].state, s: arr[i].liveStartSec, e: arr[i].liveEndSec };
+      state.liveMap = map;
+    }
+    function refreshMap() {
+      if (!connected() || !state.loaded || state.mapRefreshing) return;
+      state.mapRefreshing = true;
+      callServer("retakeV2Map", { reviewId: state.reviewId }).then(
+        function (res) { state.mapRefreshing = false; setMap(res && res.map); render(); },
+        function () { state.mapRefreshing = false; }
+      );
+    }
+    function seekToWord(index) {
+      var m = state.liveMap[index], w = wordByIndex(index);
+      var sec = m && m.s != null ? m.s : w ? w.startSec : null;
+      if (sec != null) { callHostDirect("setPlayhead", { seconds: sec }); setStatus("Playhead → " + mmss(sec)); }
+    }
+    function updateHighlight(sec) {
+      var found = null;
+      for (var i = 0; i < state.words.length; i++) {
+        var m = state.liveMap[i]; if (!m || m.state === "absent" || m.s == null) continue;
+        if (sec >= m.s && sec < m.e) { found = i; break; }
+      }
+      if (found === state.currentWord) return;
+      var oldWord = el.v2Document.querySelector(".v2-word.current"); if (oldWord) oldWord.classList.remove("current");
+      var oldSentence = el.v2Document.querySelector(".v2-sentence.current"); if (oldSentence) oldSentence.classList.remove("current");
+      state.currentWord = found;
+      if (found == null) return;
+      var node = el.v2Document.querySelector('.v2-word[data-word="' + found + '"]');
+      if (!node) return;
+      node.classList.add("current");
+      var sentence = node.closest(".v2-sentence"); if (sentence) sentence.classList.add("current");
+      if (state.follow) {
+        var r = node.getBoundingClientRect(), cr = el.v2Document.getBoundingClientRect();
+        if (r.top < cr.top || r.bottom > cr.bottom) node.scrollIntoView({ block: "center" });
+      }
+    }
+    function pollTick() {
+      if (activeTab !== "retake-v2" || !connected() || !state.loaded || state.busy || hostBusy() || state.pollInFlight) return;
+      state.pollInFlight = true;
+      callHostDirect("getPlayhead", {}, function (r) {
+        state.pollInFlight = false;
+        if (r && r.status === "OK" && r.result && r.result.seconds != null) updateHighlight(r.result.seconds);
+      });
+    }
+    function startPoll() { if (state.pollTimer) clearInterval(state.pollTimer); state.pollTimer = setInterval(pollTick, POLL_MS); }
+    function stopPoll() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
+    function onShow() { if (state.loaded) refreshMap(); startPoll(); }
+    function onHide() { stopPoll(); }
+
+    function updateSummary() {
+      if (!state.loaded) { el.v2Summary.textContent = ""; return; }
+      var cut = 0, manual = 0, removed = 0;
+      for (var i = 0; i < state.words.length; i++) {
+        if (state.words[i].decision === "cut") cut++;
+        if (state.words[i].manual) manual++;
+        if (isAbsent(state.words[i])) removed++;
+      }
+      el.v2Summary.textContent = state.words.length + " words · " + cut + " approved to cut" + (manual ? " · " + manual + " manual" : "") + (removed ? " · " + removed + " removed" : "");
+    }
+    function updateButtons() {
+      if (!el.v2LoadBtn) return;
+      setBusyBar("v2", state.busy);
+      el.v2LoadBtn.disabled = !connected() || state.busy;
+      el.v2AnalyzeBtn.disabled = !connected() || state.busy;
+      el.v2StopBtn.style.display = state.busy ? "" : "none";
+      el.v2ApplyBtn.disabled = !connected() || state.busy || !cutRanges().length;
+      el.v2UndoBtn.style.display = state.undoAvailable && !state.busy ? "" : "none";
+      el.v2UndoBtn.disabled = !connected();
+      updateSummary();
+    }
+
+    function render() {
+      if (!state.words.length) {
+        el.v2Document.innerHTML = '<div class="empty-state"><div class="es-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 10h16M4 15h10M4 20h13"/></svg></div><div class="es-title">No transcript loaded</div><div class="es-sub">Open a sequence in Premiere, then <b>Load transcript</b>. Drag across any words to mark an exact range.</div></div>';
+        updateButtons(); return;
+      }
+      var html = '<div class="v2-page">';
+      for (var i = 0; i < state.sentences.length; i++) {
+        var sentence = state.sentences[i], first = wordByIndex(sentence.startWord);
+        if (!first) continue;
+        var lm = state.liveMap[first.index];
+        var time = lm && lm.s != null ? lm.s : first.startSec;
+        html += '<div class="v2-sentence" data-sentence="' + sentence.index + '">';
+        html += '<span class="v2-time" data-act="v2seek" data-word="' + first.index + '" title="Jump the playhead here">' + mmss(time) + '</span><span class="v2-prose">';
+        for (var j = sentence.startWord; j <= sentence.endWord; j++) {
+          var w = wordByIndex(j); if (!w) continue;
+          var classes = "v2-word" + (w.decision === "cut" ? " cut" : "") + (w.suggestionId != null ? " suggested" : "") + (w.type === "audio_event" ? " v2-event" : "") + (isAbsent(w) ? " absent" : "") + (state.currentWord === w.index ? " current" : "");
+          var tip = w.reason ? esc(w.reason + (w.suggestionId != null ? " — click to accept/reject this suggestion" : "")) : "Drag to select this word";
+          html += '<span class="' + classes + '" data-word="' + w.index + '"' + (w.suggestionId != null ? ' data-sug="' + w.suggestionId + '"' : "") + ' data-tip="' + tip + '">' + esc(w.text) + '</span> ';
+        }
+        html += "</span></div>";
+      }
+      html += "</div>";
+      el.v2Document.innerHTML = html;
+      paintSelection(); updateButtons();
+    }
+
+    function wire() {
+      cache(); loadFollow(); el.v2Follow.checked = state.follow;
+      el.v2LoadBtn.addEventListener("click", loadTranscript);
+      el.v2AnalyzeBtn.addEventListener("click", analyze);
+      el.v2StopBtn.addEventListener("click", stop);
+      el.v2ApplyBtn.addEventListener("click", applyCuts);
+      el.v2UndoBtn.addEventListener("click", undo);
+      el.v2CutBtn.addEventListener("click", function () { markSelection("cut"); });
+      el.v2KeepBtn.addEventListener("click", function () { markSelection("keep"); });
+      el.v2ClearSelectionBtn.addEventListener("click", clearSelection);
+      el.v2Follow.addEventListener("change", function () { state.follow = el.v2Follow.checked; persistFollow(); });
+
+      el.v2Document.addEventListener("mousedown", function (ev) {
+        var word = ev.target.closest && ev.target.closest(".v2-word"); if (!word || state.busy) return;
+        ev.preventDefault(); state.dragging = true; state.dragMoved = false;
+        state.selectA = state.selectB = Number(word.getAttribute("data-word")); paintSelection();
+      });
+      el.v2Document.addEventListener("mouseover", function (ev) {
+        if (!state.dragging) return;
+        var word = ev.target.closest && ev.target.closest(".v2-word"); if (!word) return;
+        var i = Number(word.getAttribute("data-word"));
+        if (i !== state.selectB) { state.selectB = i; state.dragMoved = true; paintSelection(); }
+      });
+      document.addEventListener("mouseup", function (ev) {
+        if (!state.dragging) return;
+        state.dragging = false;
+      });
+      el.v2Document.addEventListener("click", function (ev) {
+        // CEP does not reliably bubble a webview mouseup to `document`, even
+        // though it still emits the click. Handle the no-drag suggestion toggle
+        // here so a click cannot get stranded as a one-word selection.
+        var moved = state.dragMoved;
+        state.dragMoved = false;
+        var word = ev.target.closest && ev.target.closest(".v2-word[data-sug]");
+        if (word && !moved) {
+          var id = word.getAttribute("data-sug"); clearSelection(); toggleSuggestion(id); return;
+        }
+        var seek = ev.target.closest && ev.target.closest('[data-act="v2seek"]');
+        if (seek) seekToWord(Number(seek.getAttribute("data-word")));
+      });
+    }
+
+    function markUndoable() { state.undoAvailable = true; updateButtons(); }
+    function clearUndoable() { state.undoAvailable = false; updateButtons(); }
+    return { wire: wire, onShow: onShow, onHide: onHide, updateButtons: updateButtons, markUndoable: markUndoable, clearUndoable: clearUndoable, setMap: setMap };
+  })();
+
   /* ---------- init ---------- */
   Silence.wire();
   Retake.wire();
+  RetakeV2.wire();
   AI.wire();
   selectTab("silence");
   connect();
   // Debug handle for browser-based QA (the gallery/QA flow drives the real panel
   // outside CEP, where there's no server to push data): lets a console inject
   // segments/config, e.g. __editagent.Retake.applyReviewUpdate([...]).
-  window.__editagent = { Retake: Retake, Silence: Silence, AI: AI };
+  window.__editagent = { Retake: Retake, RetakeV2: RetakeV2, Silence: Silence, AI: AI };
 })();

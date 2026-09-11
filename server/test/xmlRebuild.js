@@ -1,9 +1,6 @@
-// Checks for the TimeBolt-style XML rebuild apply (no Premiere): keep-span
-// layout math (cuts subtract, compaction, source mapping, multi-track sync),
-// xmeml emission, and the applyRangesBatched routing (rebuild vs razor).
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+// Checks the legacy XML helpers (no Premiere): keep-span layout math (cuts
+// subtract, compaction, source mapping, multi-track sync) and xmeml emission.
+// Runtime applies must stay on the active sequence via the in-place path.
 import { computeKeepLayout, buildXmeml } from "../rebuild.js";
 import { applyRangesBatched } from "../silences.js";
 
@@ -84,18 +81,14 @@ check("frame fields are ints", /<start>150<\/start><end>540<\/end><in>510<\/in><
 const xmlNtsc = buildXmeml({ sequenceName: "S", fps: 29.97, width: 1920, height: 1080, layout, videoTrackCount: 1, audioTrackCount: 1 });
 check("29.97 → ntsc TRUE", /<timebase>30<\/timebase><ntsc>TRUE<\/ntsc>/.test(xmlNtsc), null);
 
-// --- routing: big ripple job → importXmlSequence, no razoring ---
-function makeCtx(onCall) {
+// --- runtime routing: even a large ripple job stays in place ---
+function makeCtx() {
   const calls = [];
   return {
     calls,
-    cacheDir: mkdtempSync(join(tmpdir(), "ea-rebuild-")),
     bridge: {
       callHost: async (action, params) => {
         calls.push({ action, ...params });
-        if (onCall) { const r = onCall(action, params); if (r) return r; }
-        if (action === "exportXmlSequence") throw new Error("no live sequence to export (test)"); // this suite tests the GENERATED path; round-trip is covered in xmlRoundtrip.js
-        if (action === "importXmlSequence") return { ok: true, sequenceName: params.sequenceName, opened: true, imported: 1 };
         return { ok: true };
       },
       notifyPanel: () => {},
@@ -107,32 +100,9 @@ const FRAMES = CUTS.map((c) => ({ ...c }));
 
 const ctxR = makeCtx();
 const rr = await applyRangesBatched(ctxR, FRAMES, { ripple: true, fps: 30, timeline: TIMELINE, rebuildMin: 1 });
-const importCall = ctxR.calls.find((c) => c.action === "importXmlSequence");
-check("rebuild routed: importXmlSequence called, no razor ops", !!importCall && !ctxR.calls.some((c) => c.action === "removeRangesBatch"), ctxR.calls);
-check("rebuild result: applied 2, ~4s, sequence name", rr.rebuild === true && rr.applied === 2 && Math.abs(rr.appliedSec - 4) < 1e-6 && /tightened/.test(rr.sequenceName), rr);
-check("xml file written and parseable-ish", existsSync(importCall.path) && /<xmeml/.test(readFileSync(importCall.path, "utf8")), importCall.path);
-
-// import failure → falls back to razor path
-const ctxF = makeCtx((action) => { if (action === "importXmlSequence") throw new Error("import blew up"); });
-const rf = await applyRangesBatched(ctxF, FRAMES, { ripple: true, fps: 30, timeline: TIMELINE, rebuildMin: 1 });
-check("import failure falls back to razor", !rf.rebuild && ctxF.calls.some((c) => c.action === "removeRangesBatch") && ctxF.calls.some((c) => c.action === "closeRangeGaps"), ctxF.calls.map((c) => c.action));
-check("fallback still applies", rf.applied === 2, rf);
-
-// unsupported timeline (title clip) → silent fallback to razor
-const ctxU = makeCtx();
-const TLU = { ...TIMELINE, clips: [...TIMELINE.clips, clip("V2.0", "video", 1, 0, 5, 0, { mediaPath: null, name: "Title" })] };
-const ru = await applyRangesBatched(ctxU, FRAMES, { ripple: true, fps: 30, timeline: TLU, rebuildMin: 1 });
-check("unsupported timeline falls back to razor", !ru.rebuild && ctxU.calls.some((c) => c.action === "removeRangesBatch"), ctxU.calls.map((c) => c.action));
-
-// lift mode (ripple false) never rebuilds
-const ctxL = makeCtx();
-await applyRangesBatched(ctxL, FRAMES, { ripple: false, fps: 30, timeline: TIMELINE, rebuildMin: 1 });
-check("keepSpaces (no ripple) never rebuilds", !ctxL.calls.some((c) => c.action === "importXmlSequence"), ctxL.calls.map((c) => c.action));
-
-// below threshold → razor
-const ctxT = makeCtx();
-await applyRangesBatched(ctxT, FRAMES, { ripple: true, fps: 30, timeline: TIMELINE, rebuildMin: 100 });
-check("below rebuildMin → razor path", !ctxT.calls.some((c) => c.action === "importXmlSequence") && ctxT.calls.some((c) => c.action === "removeRangesBatch"), ctxT.calls.map((c) => c.action));
+check("large ripple apply never exports or imports XML", !ctxR.calls.some((c) => /XmlSequence$/.test(c.action)), ctxR.calls);
+check("large ripple apply razors and closes gaps in place", ctxR.calls.map((c) => c.action).join(",") === "removeRangesBatch,closeRangeGaps", ctxR.calls);
+check("in-place result reports both cuts applied", !rr.rebuild && rr.applied === 2 && Math.abs(rr.appliedSec - 4) < 1e-6, rr);
 
 console.log(failures === 0 ? "\nAll xml-rebuild checks passed." : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

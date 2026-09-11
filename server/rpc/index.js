@@ -6,11 +6,14 @@
 //    (subscription, no chat) and apply the answer — see server/ai.js.
 import { readdir, stat, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { buildReview, markDecisions, applyReview, reconcile, reinsertTarget, requireReview, planEditMarkers, EDIT_MARKER_SENTINEL, buildTranscriptCues, formatSrt } from "../review.js";
+import { buildReview, markDecisions, applyReview, reconcile, reinsertTarget, reinsertTargetFrame, requireReview, planEditMarkers, EDIT_MARKER_SENTINEL, buildTranscriptCues, formatSrt } from "../review.js";
 import { buildLevels, levelsForPanel, applySilenceRanges } from "../silences.js";
 import { restoreUndo, hasUndo } from "../undo.js";
 import { liveEnv, setEnvKey } from "../config.js";
 import { askClaude, THRESHOLD_SCHEMA, thresholdSystem, thresholdPrompt, analyzeRetakes } from "../ai.js";
+import { analyzeRetakesFast, retakeMode } from "../retakes/fast.js";
+import { analyzeRetakesWordAi } from "../retakes/word-ai.js";
+import { applyRetakeV2, reconcileRetakeV2 } from "../retake-v2.js";
 import { readUsage, recordUsage } from "../usage.js";
 
 // Model/effort come from the panel dropdowns; fall back to .env, then sane defaults.
@@ -67,11 +70,59 @@ async function loadSegments(params, helpers, ctx) {
     helpers.progress(`Found ${review.segments.length} segments.`);
     return {
       sequence: review.sequence,
+      reviewId: review.reviewId,
       frameRate: review.frameRate,
       dropFrame: review.dropFrame,
       segments: review.segments,
       skipped: review.skipped,
       fragments: review.fragments,
+    };
+  });
+}
+
+/** Word-preserving transcript for the document-style Retake V2 tab. */
+async function loadRetakeV2(params, helpers, ctx) {
+  return cancellable(ctx, async () => {
+    const review = await buildReview(ctx, { clipId: params.clip_id, refresh: !!params.refresh, transcribeModel: params.transcribe_model }, helpers.progress);
+    helpers.progress(`Loaded ${review.words.length} words in ${review.sentences.length} sentences.`);
+    return {
+      sequence: review.sequence,
+      reviewId: review.reviewId,
+      frameRate: review.frameRate,
+      dropFrame: review.dropFrame,
+      words: review.words,
+      sentences: review.sentences,
+      skipped: review.skipped,
+    };
+  });
+}
+
+/** Live word positions used for playhead highlighting; apply does its own fresh read. */
+async function retakeV2Map(_params, _helpers, ctx) {
+  if (!_params.reviewId || !ctx.review || _params.reviewId !== ctx.review.reviewId) {
+    throw new Error("This V2 transcript is stale because the timeline review changed. Reload the transcript before continuing.");
+  }
+  return reconcileRetakeV2(ctx);
+}
+
+/** Apply only the exact word ranges approved in V2. */
+async function applyRetakeV2Ranges(params, helpers, ctx) {
+  return cancellable(ctx, async () => {
+    if (!params.reviewId || !ctx.review || params.reviewId !== ctx.review.reviewId) {
+      throw new Error("This V2 transcript is stale because the timeline review changed. Reload it before applying cuts.");
+    }
+    const ranges = Array.isArray(params.ranges) ? params.ranges : [];
+    if (!ranges.length) return { applied: 0, requested: 0, message: "No words are marked Cut. Select words, then choose Cut." };
+    const res = await applyRetakeV2(ctx, ranges, { removeGaps: params.removeGaps !== false }, helpers.progress);
+    if (!res.requested) {
+      return { ...res, message: res.alreadyGone ? "Those words are already absent from the live timeline." : "No safe, live word ranges were available to cut." };
+    }
+    return {
+      ...res,
+      message:
+        (res.aborted ? `Stopped after ${res.applied} cut(s).` : `Applied ${res.applied}/${res.requested} word-range cut(s) (~${res.appliedSec}s)${params.removeGaps !== false ? " and closed the gaps" : " (gaps left in place)"}.`) +
+        (res.errors && res.errors.length ? ` ${res.errors.length} error(s). First: ${res.errors[0].error}` : "") +
+        (res.applied ? " Use Undo to revert." : ""),
     };
   });
 }
@@ -107,13 +158,6 @@ async function applyDecisions(params, helpers, ctx) {
             (trimExcess ? " and no excess non-speech was found to trim." : ". Mark segments (or run Analyze w/ Claude), then Apply All.")
           : `All ${res.cutsMarked} Cut segment(s) are already removed from the timeline (~${res.alreadyGoneSec}s cut earlier). Nothing new to apply.`;
       return { applied: 0, ripple, cutsRequested: 0, cutsMarked: res.cutsMarked, alreadyGone: res.alreadyGone, revision: res.revision, message };
-    }
-    if (res.rebuild) {
-      return {
-        ...res,
-        cutsRequested: res.requested,
-        message: `Created tightened sequence "${res.sequenceName}" with ${res.applied} cut(s) removed. The original sequence is untouched; delete the new one to discard.`,
-      };
     }
     return {
       ...res,
@@ -242,7 +286,7 @@ async function reinsertSegment(params, helpers, ctx) {
       throw new Error("This segment predates re-insert support. Click Reload, then try again.");
     }
 
-    const { map } = await reconcile(ctx);
+    const { map, frameRate } = await reconcile(ctx);
     const byIndex = new Map(map.map((m) => [m.index, m]));
     const me = byIndex.get(index);
     if (me && me.state === "present") {
@@ -251,6 +295,7 @@ async function reinsertSegment(params, helpers, ctx) {
 
     // Insert right before the next still-present segment (exactly where it was).
     const target = reinsertTarget(review.segments, map, index);
+    const targetFrame = reinsertTargetFrame(review.segments, map, index, frameRate || review.frameRate || 30);
 
     helpers.progress("Re-inserting the clip…");
     const host = await ctx.bridge.callHost(
@@ -259,7 +304,10 @@ async function reinsertSegment(params, helpers, ctx) {
         mediaPath: seg.mediaPath,
         sourceInSec: seg.sourceInSec,
         sourceOutSec: seg.sourceOutSec,
+        sourceInTicks: seg.sourceInTicks,
+        sourceOutTicks: seg.sourceOutTicks,
         targetSeconds: target,
+        targetFrame,
         trackIndex: seg.trackType === "video" ? (seg.trackIndex || 0) : 0,
       },
       { timeoutMs: 30000 }
@@ -351,14 +399,36 @@ async function aiRetakes(params, helpers, ctx) {
     // job is real speech (retakes / false starts / filler).
     const emptyIdx = new Set(review.segments.filter((s) => s.fragment === "empty").map((s) => s.index));
     const speechSegs = review.segments.filter((s) => !emptyIdx.has(s.index));
-    // Chunked + concurrent: one call per whole long timeline is unreliable (lazy
-    // mid-list / times out). analyzeRetakes windows it and merges the cuts.
-    const decisions = await analyzeRetakes(speechSegs, {
-      model: aiModel(params),
-      effort: aiEffort(params),
-      token,
-      onProgress: helpers.progress,
-    });
+    // Which engine finds the retakes (EDITAGENT_RETAKE_MODE, or retake_mode on the call):
+    //   fast (default)   conservative direct-evidence detection only. No model at all.
+    //   hybrid           the same, then one small Claude call on the unclear groups only.
+    //                    Seconds instead of minutes, ~1 call instead of ~24.
+    //   ai               the original chunked whole-timeline path, kept as the reference.
+    const mode = retakeMode(params);
+    let decisions;
+    let engine = { mode };
+    if (mode === "ai") {
+      // Chunked + concurrent: one call per whole long timeline is unreliable (lazy
+      // mid-list / times out). analyzeRetakes windows it and merges the cuts.
+      decisions = await analyzeRetakes(speechSegs, {
+        model: aiModel(params),
+        effort: aiEffort(params),
+        token,
+        onProgress: helpers.progress,
+      });
+    } else {
+      const out = await analyzeRetakesFast(speechSegs, {
+        mode,
+        model: aiModel(params),
+        // The model now only picks a keeper inside an already-grouped run, so the
+        // heavy reasoning effort the whole-timeline path needed buys nothing here.
+        effort: params.effort || liveEnv("EDITAGENT_RETAKE_EFFORT") || "medium",
+        token,
+        onProgress: helpers.progress,
+      });
+      decisions = out.decisions;
+      engine = { mode, ...out.stats };
+    }
     if (token.aborted) throw new Error("Cancelled");
     // Fresh analysis: clear prior non-protected marks, then apply Claude's cuts —
     // but keep the deterministic no-speech cuts (not Claude's to revisit).
@@ -375,7 +445,52 @@ async function aiRetakes(params, helpers, ctx) {
         ...(typeof d.reason === "string" && d.reason ? { reason: d.reason } : {}),
       }));
     const summary = markDecisions(ctx, clean); // mutates ctx.review + pushes reviewUpdate to the panel
-    return { ...summary, analyzed: speechSegs.length, decisions: clean.length };
+    if (engine.mode !== "ai") {
+      if (engine.mode === "fast") {
+        helpers.progress(
+          `${clean.length} certain take(s) marked to cut. ` +
+          `${engine.reviewGroups || 0} possible group(s) stayed Keep for manual review. No AI call.`
+        );
+      } else {
+        helpers.progress(
+          `${clean.length} take(s) marked to cut. ` +
+          (engine.escalated
+            ? `${engine.escalated} group(s) went to Claude (${engine.changed} changed).`
+            : "No AI call was needed.")
+        );
+      }
+    }
+    return { ...summary, analyzed: speechSegs.length, decisions: clean.length, engine };
+  });
+}
+
+/** V2 AI-Lite: Claude sees the whole transcript, then returns exact word ranges. */
+async function aiRetakesV2(params, helpers, ctx) {
+  return cancellable(ctx, async (token) => {
+    let review = ctx.review;
+    if (!review || !Array.isArray(review.words) || !review.words.length) {
+      helpers.progress("Transcribing the timeline before AI-Lite review…");
+      review = await buildReview(ctx, { clipId: params.clip_id, transcribeModel: params.transcribe_model }, helpers.progress);
+    }
+    if (token.aborted) throw new Error("Cancelled");
+    if (!review.words.length || !review.sentences.length) throw new Error("No spoken words to analyze. Load the timeline first.");
+
+    // AI-Lite intentionally defaults to Sonnet/low even when the general panel AI
+    // setting is Latest/high. That older default caused the token spikes this path
+    // exists to avoid. Explicit word_* params remain available for experiments.
+    const model = params.word_model || (params.model && params.model !== "latest" ? params.model : "sonnet");
+    const effort = params.word_effort || "low";
+    const result = await analyzeRetakesWordAi(review.words, review.sentences, {
+      model, effort, token, onProgress: helpers.progress,
+    });
+    return {
+      reviewId: review.reviewId,
+      suggestions: result.suggestions,
+      words: review.words,
+      sentences: review.sentences,
+      analyzed: review.sentences.length,
+      engine: { mode: "ai-lite", ...result.stats },
+    };
   });
 }
 
@@ -496,17 +611,26 @@ const ENV_SPECS = [
   { key: "EDITAGENT_AI_EFFORT", def: "high", desc: "Fallback reasoning effort for the AI buttons. low, medium, high, xhigh or max." },
   { key: "EDITAGENT_AI_TIMEOUT_MS", def: "600000", desc: "Hard timeout for one headless Claude call, in milliseconds. Raise it for very long analyses." },
   { key: "EDITAGENT_CLAUDE_BIN", def: "", desc: "Full path to the claude CLI if it isn't found automatically." },
+  { key: "EDITAGENT_RETAKE_MODE", def: "fast", desc: "How Analyze w/ Claude finds retakes. fast = compare individual and short multi-row takes for direct repeated-prefix or high-similarity retries; lower-confidence matches stay Keep, with no AI call. hybrid = broader local matching, then ask Claude about unclear groups (adds 20-60s). ai = the old whole-timeline Claude path (minutes)." },
+  { key: "EDITAGENT_RETAKE_ESCALATE", def: "tight", desc: "How much goes to Claude in hybrid mode. tight = only genuinely unclear groups. wide = every group with more than one complete take (more accurate, still one call)." },
+  { key: "EDITAGENT_RETAKE_EFFORT", def: "medium", desc: "Reasoning effort for the small hybrid-mode call. low, medium or high." },
+  { key: "EDITAGENT_RETAKE_GROUP_BATCH", def: "120", desc: "Max segments bundled into one hybrid-mode review call." },
+  { key: "EDITAGENT_RETAKE_GROUP_CONCURRENCY", def: "2", desc: "How many hybrid-mode review calls run at the same time." },
+  { key: "EDITAGENT_RETAKE_V2_CHUNK_WORDS", def: "900", desc: "Retake V2 AI-Lite: approximate owner words reviewed in each full-transcript pass." },
+  { key: "EDITAGENT_RETAKE_V2_CONTEXT_WORDS", def: "120", desc: "Retake V2 AI-Lite: overlap words shown on each side of a transcript pass." },
+  { key: "EDITAGENT_RETAKE_V2_PRECISION_WORDS", def: "1000", desc: "Retake V2 AI-Lite: maximum candidate words bundled into one exact-boundary call." },
+  { key: "EDITAGENT_RETAKE_V2_CONCURRENCY", def: "4", desc: "Retake V2 AI-Lite: maximum concurrent full-transcript calls." },
   { key: "EDITAGENT_AI_CHUNK", def: "36", desc: "Segments per chunk when Analyze w/ Claude splits a long timeline into windows." },
   { key: "EDITAGENT_AI_CHUNK_CONTEXT", def: "14", desc: "Extra context segments each chunk sees on both sides of its window." },
   { key: "EDITAGENT_AI_CONCURRENCY", def: "4", desc: "How many analysis chunks run at the same time." },
-  { key: "EDITAGENT_SCRIBE_MODEL", def: "scribe_v2", desc: "ElevenLabs speech-to-text model. The Transcription dropdown above overrides this." },
-  { key: "EDITAGENT_SCRIBE_RATE", def: "0.22", desc: "ElevenLabs list price per audio hour, used only for the usage log's cost estimates." },
+  { key: "EDITAGENT_WHISPER_MODEL", def: "small.en", desc: "Local whisper model for transcription (tiny.en, base.en, small.en, medium.en, large-v3). The Transcription dropdown above overrides this." },
+  { key: "EDITAGENT_PHRASE_GAP_SEC", def: "0.5", desc: "Retakes: split a clip into a new segment on an internal pause this long (seconds). Smaller = finer keep/cut chunks." },
+  { key: "EDITAGENT_PHRASE_SPLIT_SENTENCE", def: "1", desc: "Retakes: also split segments at sentence punctuation (. ? !) so each is about one sentence. Set 0 to split on pauses only." },
+  { key: "EDITAGENT_PHRASE_MAX_WORDS", def: "14", desc: "Retakes: hard-cap a run-on segment (no punctuation or pauses) at this many words." },
   { key: "EDITAGENT_TRANSCRIBE_MERGE_GAP", def: "5", desc: "Merge used clip ranges closer than this many seconds into one continuous transcription range." },
   { key: "EDITAGENT_TRANSCRIBE_BATCH_SEC", def: "360", desc: "Max seconds of audio bundled into one transcription upload. Smaller parts give finer progress; larger parts mean fewer calls." },
   { key: "EDITAGENT_TRANSCRIBE_CONCURRENCY", def: "3", desc: "How many transcription parts are extracted and uploaded at the same time." },
   { key: "EDITAGENT_TRANSCRIBE_PAD", def: "0.25", desc: "Seconds of audio context kept on each edge of a transcribed range so edge words aren't clipped." },
-  { key: "EDITAGENT_REBUILD_MIN", def: "100", desc: "Ripple applies with at least this many cuts use the fast XML rebuild instead of razoring in place. 0 disables it." },
-  { key: "EDITAGENT_ROUNDTRIP", def: "1", desc: "Fast applies round-trip Premiere's own XML so effects survive. Set 0 to use the bare rebuild (drops effects)." },
   { key: "EDITAGENT_TRIM_EXCESS_PAD", def: "0.15", desc: "Seconds of breathing room kept around words when Remove excess trims non-speech air." },
   { key: "EDITAGENT_TRIM_EXCESS_MIN", def: "0.2", desc: "Non-speech air shorter than this many seconds is left alone by Remove excess." },
   { key: "PREMIERE_BRIDGE_PORT", def: "3001", desc: "Port the panel and server talk over.", live: false },
@@ -565,7 +689,7 @@ async function ping() {
   return { ok: true };
 }
 
-const HANDLERS = { ping, cancel, loadSegments, applyDecisions, softApply, clearMarkers, exportTranscript, timelineMap, reinsertSegment, analyzeLevels, applySilences, aiThreshold, aiRetakes, undoLastApply, undoStatus, cacheInfo, clearCache, usageLog, keyStatus, setApiKey, envList, setEnv };
+const HANDLERS = { ping, cancel, loadSegments, loadRetakeV2, retakeV2Map, applyRetakeV2Ranges, applyDecisions, softApply, clearMarkers, exportTranscript, timelineMap, reinsertSegment, analyzeLevels, applySilences, aiThreshold, aiRetakes, aiRetakesV2, undoLastApply, undoStatus, cacheInfo, clearCache, usageLog, keyStatus, setApiKey, envList, setEnv };
 
 export function createRpcDispatcher(ctx) {
   return async (method, params, helpers) => {

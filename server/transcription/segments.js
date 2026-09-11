@@ -40,13 +40,18 @@ function contentTokens(words) {
  * Group content tokens into phrases, breaking on a silence >= silenceThreshold
  * OR a speaker change. Returns [{ start, end, text, speaker }].
  */
-export function groupIntoPhrases(words, silenceThreshold = 0.5) {
+export function groupIntoPhrases(words, silenceThreshold = 0.5, opts = {}) {
+  // Finer chunking so retake keep/cut targets a precise span: also break a phrase
+  // at sentence-ending punctuation (whisper emits it) and cap very long run-ons.
+  const splitOnSentence = !!opts.splitOnSentence;
+  const maxWords = opts.maxWords || 0; // 0 = no cap
   const toks = contentTokens(words);
   const phrases = [];
   let cur = [];
   let curStart = null;
   let curSpeaker = null;
   let prevEnd = null;
+  let curWords = 0;
 
   const flush = () => {
     if (!cur.length) return;
@@ -70,6 +75,7 @@ export function groupIntoPhrases(words, silenceThreshold = 0.5) {
     cur = [];
     curStart = null;
     curSpeaker = null;
+    curWords = 0;
   };
 
   for (const t of toks) {
@@ -81,6 +87,13 @@ export function groupIntoPhrases(words, silenceThreshold = 0.5) {
     }
     cur.push(t);
     prevEnd = t.end;
+    // End the phrase AFTER this token on a sentence boundary or the word cap, so a
+    // long unbroken run still splits into sentence-sized, separately-cuttable segments.
+    if (t.type !== "audio_event") {
+      curWords += 1;
+      const endsSentence = splitOnSentence && /[.?!]["'”’)\]]*$/.test((t.text || "").trim());
+      if (endsSentence || (maxWords > 0 && curWords >= maxWords)) flush();
+    }
   }
   flush();
   return phrases;

@@ -84,19 +84,25 @@ function friendlyError(message, code) {
  * Run one headless judgment call.
  * @param {object} o
  * @param {string} o.prompt        the user message (sent on stdin — no arg-size limit)
- * @param {string} [o.system]      full system prompt (REPLACES the default — keeps it focused/cheap)
+ * @param {string} [o.system]      instructions for the call
+ * @param {boolean} [o.inlineSystem] send `system` as the head of the user message instead
+ *   of via --system-prompt. MEASURED (2026-09-09): --system-prompt REPLACES the CLI's
+ *   default prefix, which drops prompt caching to zero (cache_read=0) and roughly triples
+ *   the thinking the model does. Same tiny question: 84s with --system-prompt vs 15-30s
+ *   with the text inlined and the cached prefix intact. Answers were identical.
  * @param {object} [o.schema]      JSON Schema; forces a validated structured result
  * @param {string} [o.model]       "latest" (omit flag) | alias (opus/sonnet/haiku/fable) | full id
  * @param {string} [o.effort]      low|medium|high|xhigh|max
  * @param {object} [o.token]       cancel token (ctx.panelOp); we set token.child so "cancel" can kill us
  * @returns {Promise<{data:any, raw:object}>}  data = structured_output (or parsed result)
  */
-export function askClaude({ prompt, system, schema, model, effort, token } = {}) {
+export function askClaude({ prompt, system, schema, model, effort, token, inlineSystem = false } = {}) {
   return new Promise((resolve, reject) => {
     const [bin, ...prefixArgs] = resolveClaudeLaunch();
     const args = [...prefixArgs, "-p", "--output-format", "json", "--strict-mcp-config", "--tools", "", "--no-session-persistence"];
     if (schema) args.push("--json-schema", JSON.stringify(schema));
-    if (system) args.push("--system-prompt", system);
+    const inline = inlineSystem && liveEnv("EDITAGENT_AI_INLINE_SYSTEM") !== "0";
+    if (system && !inline) args.push("--system-prompt", system);
     if (model && model !== "latest") args.push("--model", model);
     if (effort) args.push("--effort", effort);
 
@@ -164,7 +170,7 @@ export function askClaude({ prompt, system, schema, model, effort, token } = {})
     });
 
     try {
-      child.stdin.write(prompt || "");
+      child.stdin.write(inline && system ? `${system}\n\n${prompt || ""}` : (prompt || ""));
       child.stdin.end();
     } catch (e) {
       // If the child already died, 'close'/'error' handlers will settle the promise.

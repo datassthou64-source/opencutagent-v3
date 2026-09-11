@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:;" />
     <title>OpenCutAgent</title>
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles.css?v=retake-v2" />
   </head>
   <body>
     <div class="wrap">
@@ -58,14 +58,26 @@
           <div id="aiHint" class="pop-hint">The “Suggest threshold” and “Analyze w/ Claude” buttons run Claude headlessly here, on your Claude subscription. Turn on Sync to drive OpenCutAgent from a Claude Code chat instead.</div>
         </div>
         <div class="pop-sec">
+          <div class="pop-title">Classic retake engine</div>
+          <div id="retakeSeg" class="seg" role="radiogroup" aria-label="How the Classic Retakes tab finds retakes">
+            <button type="button" class="seg-btn" data-mode="fast" role="radio" aria-checked="false">Fast</button>
+            <button type="button" class="seg-btn" data-mode="hybrid" role="radio" aria-checked="false">Hybrid</button>
+            <button type="button" class="seg-btn" data-mode="ai" role="radio" aria-checked="false">Full AI</button>
+          </div>
+          <div id="retakeHint" class="pop-hint">Loading&hellip;</div>
+        </div>
+        <div class="pop-sec">
           <div class="pop-title">Transcription</div>
           <label class="pop-row"><span>Model</span>
             <select id="sttModel">
-              <option value="scribe_v2">Scribe v2</option>
-              <option value="scribe_v1">Scribe v1 (retired)</option>
+              <option value="tiny.en">Whisper tiny.en (fastest)</option>
+              <option value="base.en">Whisper base.en</option>
+              <option value="small.en">Whisper small.en (default)</option>
+              <option value="medium.en">Whisper medium.en</option>
+              <option value="large-v3">Whisper large-v3 (most accurate)</option>
             </select>
           </label>
-          <div class="pop-hint">ElevenLabs speech to text model used by Load ($0.22 per audio hour). Already-transcribed audio stays cached; Clear cache to re-transcribe with a different model.</div>
+          <div class="pop-hint">Local whisper model used by Load (runs on this computer, no API key, no cost). Bigger models are more accurate but slower. Already-transcribed audio stays cached; Clear cache to re-transcribe with a different model.</div>
         </div>
         <div class="pop-sec">
           <div class="pop-title">Storage</div>
@@ -74,9 +86,9 @@
             <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
             <span class="lbl">Clear cache</span>
           </button>
-          <div class="pop-hint">Transcripts and audio scans are cached per source file so reloads are free. Clearing means the next Load re-transcribes (ElevenLabs credits).</div>
+          <div class="pop-hint">Transcripts and audio scans are cached per source file so reloads are fast. Clearing means the next Load re-transcribes from scratch.</div>
         </div>
-        <div class="pop-sec">
+        <div class="pop-sec" hidden style="display:none">
           <div class="pop-title">ElevenLabs</div>
           <div class="pop-row"><span>API key</span><span id="keyState" class="pop-val">…</span></div>
           <button id="keyBtn" class="sm" data-tip="The ElevenLabs API key that pays for transcription (Load segments / Analyze w/ Claude). Silence removal never needs it.">
@@ -114,6 +126,10 @@
         <button class="tab" data-tab="retake">
           <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.12 15.88M14.47 14.48 20 20M8.12 8.12 12 12"/></svg>
           Retakes
+        </button>
+        <button class="tab" data-tab="retake-v2">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 10h16M4 15h10M4 20h13"/><path d="m17 14 3 3-3 3"/></svg>
+          Retake V2
         </button>
       </nav>
 
@@ -386,6 +402,62 @@
           <div id="summary" class="summary"></div>
         </div>
       </section>
+
+      <!-- ===================== RETAKE V2 ===================== -->
+      <section id="tab-retake-v2" class="tabpane hidden">
+        <div class="v2-toolbar">
+          <button id="v2LoadBtn" class="primary" disabled data-tip="Loads the cached local Whisper transcript while preserving every word and its source timestamp.">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 13h6M9 17h6"/></svg>
+            <span class="lbl">Load transcript</span>
+          </button>
+          <button id="v2AnalyzeBtn" disabled data-tip="AI-Lite reviews the entire transcript in compact overlapping passes, then makes exact word-level removal suggestions using the selected model (Sonnet when Latest) at low effort.">
+            <svg class="ic" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z"/><path d="M19 14l.6 1.9L21.5 16.5l-1.9.6L19 19l-.6-1.9L16.5 16.5l1.9-.6z"/></svg>
+            <span class="lbl">AI word cuts</span>
+          </button>
+          <button id="v2StopBtn" class="danger" style="display:none">
+            <svg class="ic" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+            Stop
+          </button>
+        </div>
+
+        <div class="statusrow v2-statusrow">
+          <div id="v2Status" class="statusbar"></div>
+          <label class="chk follow" data-tip="Highlights and scrolls to the word under Premiere's playhead as you scrub. Click a sentence timestamp to jump there.">
+            <input type="checkbox" id="v2Follow" class="switch" role="switch" checked /> Follow playhead
+          </label>
+        </div>
+
+        <div id="v2SelectionBar" class="v2-selectionbar" hidden>
+          <span id="v2SelectionLabel">0 words selected</span>
+          <span class="v2-selection-actions">
+            <button id="v2KeepBtn" class="sm">Keep selected</button>
+            <button id="v2CutBtn" class="sm danger-text">Cut selected</button>
+            <button id="v2ClearSelectionBtn" class="ghost sm">Clear</button>
+          </span>
+        </div>
+
+        <div id="v2Document" class="v2-document">
+          <div class="empty-state">
+            <div class="es-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 10h16M4 15h10M4 20h13"/></svg></div>
+            <div class="es-title">No transcript loaded</div>
+            <div class="es-sub">Open a sequence in Premiere, then <b>Load transcript</b>. Drag across any words to mark an exact range.</div>
+          </div>
+        </div>
+
+        <div class="footer v2-footer">
+          <div class="v2-help">AI-Lite always reviews the full transcript · red = approved word cut · click to reject · drag words to refine</div>
+          <label class="chk" data-tip="Closes the gaps left by removed word ranges, shifting everything after them left."><input type="checkbox" id="v2RemoveGaps" checked /> Remove gaps when applying (ripple)</label>
+          <button id="v2UndoBtn" class="undo-btn" style="display:none" data-tip="Restores the timeline to how it was before the last V2 apply.">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 3L3 13"/></svg>
+            <span class="lbl">Undo last apply</span>
+          </button>
+          <button id="v2ApplyBtn" class="primary" disabled data-tip="Reconciles these approved word ranges against the live timeline, snaps to integer Premiere frames, then removes them in one batched operation.">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+            <span class="lbl">Apply Selected Cuts</span>
+          </button>
+          <div id="v2Summary" class="summary"></div>
+        </div>
+      </section>
     </div>
     <div id="usageModal" class="modal-backdrop" hidden>
       <div class="modal" role="dialog" aria-modal="true" aria-label="AI usage log">
@@ -406,7 +478,7 @@
         </div>
         <div class="modal-foot">
           <span id="usageTotals" class="usage-totals"></span>
-          <span class="pop-hint">Claude runs are included in your subscription. Transcription is estimated at the ElevenLabs list price.</span>
+          <span class="pop-hint">Claude runs are included in your subscription. Transcription runs locally (HyperFrames whisper), so it is free.</span>
         </div>
       </div>
     </div>
@@ -433,6 +505,6 @@
       </div>
     </div>
     <div id="toast" class="toast"></div>
-    <script src="./main.js"></script>
+    <script src="./main.js?v=word-ai-lite-1"></script>
   </body>
 </html>

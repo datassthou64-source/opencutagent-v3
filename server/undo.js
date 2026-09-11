@@ -25,6 +25,13 @@ export function snapshotTimeline(timeline) {
         endSec: c.end.seconds,
         inSec: c.sourceIn.seconds,
         outSec: c.sourceOut.seconds,
+        // Preserve Premiere's exact integer tick positions. The seconds fields
+        // remain for matching older snapshots, but restoration uses ticks so an
+        // undo cannot reintroduce a fractional-frame edge.
+        startTicks: c.start.ticks,
+        endTicks: c.end.ticks,
+        inTicks: c.sourceIn.ticks,
+        outTicks: c.sourceOut.ticks,
         speedIsNormal: c.speedIsNormal,
       })),
   };

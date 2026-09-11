@@ -50,6 +50,12 @@ export function sourceSecToTimeline(wordSec, clip, timebaseTicks) {
   };
 }
 
+/** Exact source tick that corresponds to a snapped timeline frame on a clip. */
+export function timelineFrameToSourceTicks(frame, clip, timebaseTicks) {
+  const timelineTicks = BigInt(frame) * BigInt(timebaseTicks);
+  return (BigInt(clip.sourceIn.ticks) + (timelineTicks - BigInt(clip.start.ticks))).toString();
+}
+
 /**
  * Map a source-seconds range [a,b] on a clip to a timeline FRAME range,
  * clamped to the clip's visible extent. Returns null if it doesn't overlap.

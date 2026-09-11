@@ -48,15 +48,9 @@ Long timelines are **chunked**: `analyzeRetakes` splits the segment list into ov
 
 `server/audio/levels.js` extracts a per-window **peak envelope** with ffmpeg, **normalized to the recording's own peak** and floored at -60 dB. Normalization is what makes threshold values portable across recordings (a "-45" on a quietly-recorded take then behaves like "-45" in AutoCut/TimeBolt, which meter the same way). `detectSilences` applies the threshold plus the pacing knobs (min silence length, keep-talk, margins); keep-talk demotion is unconditional on length, matching industry semantics. The panel renders the envelope and recomputes zones instantly client-side with mirrored logic (`test/silence.js` pins server and panel mirrors together).
 
-## Fast apply: the three-rung ladder
+## In-place apply
 
-Applying hundreds of cuts in place is slow (each ripple shifts every downstream clip) and Premiere's per-track razor makes it O(ranges x clips). `applyRangesBatched` (`silences.js`) picks the fastest safe path:
-
-1. **Round-trip XML** (`roundtrip.js`, default for ripple applies with >= `EDITAGENT_REBUILD_MIN` cuts): export the sequence as Premiere's own FCP7 XML, surgically edit **timing only** (split/trim/delete clip items, recompute ticks, fix links, shift markers) while passing every node we don't understand through verbatim, and reimport as a new `<name> - tightened` sequence. Effects, transforms, and audio levels that FCP7 XML can carry survive. Verified live 2026-07-03.
-2. **Generated rebuild** (`rebuild.js`): if the round-trip fails, build a bare FCP7 XML sequence from our own bookkeeping (A/V sync by construction, BigInt-exact frame math). Drops clip effects; refuses timelines it cannot represent (titles, speed changes) by throwing.
-3. **Batched razor** (in-place fallback, and the path for lift/mute or small applies): razor every edge first (razors never shift), lift-delete pieces per range, then close gaps per track with self-verifying emptiness checks, chunked ~50 ranges per host call for progress and cancel.
-
-Rungs 1-2 produce a **new** sequence (undo = delete it); rung 3 edits in place under an undo snapshot (`undo.js`, Cmd+Z friendly).
+`applyRangesBatched` (`silences.js`) always edits the active sequence. It razors every edge first (razors never shift), lift-deletes pieces in chunks of roughly 50 ranges, then closes gaps per track with self-verifying emptiness checks. Both silence removal and retake cleanup use this path and capture a one-level undo snapshot in `undo.js`. The legacy XML transformation helpers remain covered as pure utilities but are not part of the apply runtime.
 
 ## Design rules that keep this maintainable
 
