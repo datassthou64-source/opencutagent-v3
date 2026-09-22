@@ -371,7 +371,14 @@
         st.sync = window.localStorage.getItem("editagent.ai.sync") === "1";
         st.model = window.localStorage.getItem("editagent.ai.model") || "latest";
         st.effort = window.localStorage.getItem("editagent.ai.effort") || "high";
-        st.sttModel = window.localStorage.getItem("editagent.sttModel") || "small.en";
+        st.sttModel = window.localStorage.getItem("editagent.sttModel") || "scribe_v2";
+        // One-time move to Scribe: earlier builds defaulted to whisper, which can skip whole
+        // passages. Anyone can switch back in the Transcription dropdown afterwards.
+        if (!window.localStorage.getItem("editagent.sttScribeDefault")) {
+          st.sttModel = "scribe_v2";
+          window.localStorage.setItem("editagent.sttModel", st.sttModel);
+          window.localStorage.setItem("editagent.sttScribeDefault", "1");
+        }
       } catch (e) {}
     }
     function persist() {
@@ -393,7 +400,7 @@
       el.aiEffort.value = st.effort;
       if (el.aiEffort.value !== st.effort) { st.effort = el.aiEffort.value || "high"; persist(); el.aiEffort.value = st.effort; }
       el.sttModel.value = st.sttModel;
-      if (el.sttModel.value !== st.sttModel) { st.sttModel = el.sttModel.value || "small.en"; persist(); el.sttModel.value = st.sttModel; }
+      if (el.sttModel.value !== st.sttModel) { st.sttModel = el.sttModel.value || "scribe_v2"; persist(); el.sttModel.value = st.sttModel; }
       el.aiCtls.className = "pop-group" + (st.sync ? " off" : ""); // model/effort irrelevant in sync mode
       if (el.aiHint) el.aiHint.textContent = st.sync
         ? "Paired with your Claude Code chat over MCP. Ask Claude to edit the timeline in chat (for example “cut the retakes”) and the results appear here for review."
@@ -2115,7 +2122,7 @@
     var el = {};
 
     function cache() {
-      ["v2LoadBtn", "v2AnalyzeBtn", "v2StopBtn", "v2Status", "v2Follow", "v2SelectionBar", "v2SelectionLabel", "v2KeepBtn", "v2CutBtn", "v2ClearSelectionBtn", "v2Document", "v2RemoveGaps", "v2UndoBtn", "v2ApplyBtn", "v2Summary"].forEach(function (id) { el[id] = $(id); });
+      ["v2LoadBtn", "v2AnalyzeBtn", "v2AutoBtn", "v2Deferred", "v2StopBtn", "v2Status", "v2Follow", "v2SelectionBar", "v2SelectionLabel", "v2KeepBtn", "v2CutBtn", "v2ClearSelectionBtn", "v2Document", "v2RemoveGaps", "v2UndoBtn", "v2ApplyBtn", "v2Summary"].forEach(function (id) { el[id] = $(id); });
     }
     function setStatus(text, isErr) { el.v2Status.textContent = text || ""; el.v2Status.className = "statusbar" + (isErr ? " err" : ""); }
     function setBusy(b) { state.busy = b; updateButtons(); }
@@ -2139,6 +2146,7 @@
     function loadTranscript() {
       if (state.busy) return;
       setBusy(true); setStatus("Loading the word-level transcript…"); setLoading(el.v2LoadBtn, true, "Loading…");
+      el.v2Deferred.hidden = true;
       el.v2Document.innerHTML = skeletonRows();
       callServer("loadRetakeV2", { transcribe_model: AI.sttModel() }, function (m) { setStatus(m); }).then(
         function (res) {
@@ -2160,27 +2168,62 @@
 
     function stop() { if (!state.busy) return; callServer("cancel", {}).catch(function () {}); setStatus("Stopping…"); }
 
-    function analyze() {
+    function analyze(autoApply) {
+      autoApply = autoApply === true;
       if (state.busy) return;
       if (AI.sync()) {
-        toast("Retake V2 AI-Lite runs from this panel. Turn off Sync with Claude Code, then choose AI word cuts.");
+        toast("Reliable retakes runs from this panel. Turn off Sync with Claude Code, then choose Analyze retakes.");
         return;
       }
-      setBusy(true); setStatus("AI-Lite is reviewing the full transcript…"); setLoading(el.v2AnalyzeBtn, true, "Analyzing…");
-      callServer("aiRetakesV2", AI.wordParams(), function (m) { setStatus(m); }).then(
+      setBusy(true); setStatus("Reviewing recorded attempts and preserving unique content…"); setLoading(el.v2AnalyzeBtn, true, "Analyzing…");
+      el.v2Deferred.hidden = true;
+      var params = AI.wordParams();
+      params.word_effort = "medium";
+      params.auto_apply = autoApply;
+      params.reviewId = state.reviewId;
+      params.protectedWords = state.words.filter(function (w) { return w.manual && w.decision === "keep"; }).map(function (w) { return w.index; });
+      callServer("reliableRetakesV2", params, function (m) { setStatus(m); }).then(
         function (res) {
           if (!state.loaded || !state.words.length || state.reviewId !== res.reviewId) {
             prepareWords(res.words || []); state.sentences = res.sentences || []; state.loaded = true;
           }
           state.reviewId = res.reviewId || state.reviewId;
           applySuggestions(res.suggestions || []);
-          setLoading(el.v2AnalyzeBtn, false, "AI word cuts"); setBusy(false); render(); refreshMap();
+          for (var si = 0; si < (res.states || []).length; si++) {
+            var outcome = res.states[si], word = wordByIndex(outcome.index);
+            if (word) word.reviewState = outcome.state;
+          }
+          for (var di = 0; di < (res.deferred || []).length; di++) {
+            var reviewItem = res.deferred[di];
+            for (var wi = reviewItem.startWord; wi <= reviewItem.endWord; wi++) {
+              var reviewWord = wordByIndex(wi);
+              if (reviewWord && !reviewWord.manual) reviewWord.reason = "Review: " + reviewItem.reason;
+            }
+          }
+          setLoading(el.v2AnalyzeBtn, false, "Analyze retakes"); setBusy(false); render(); if (!res.applied) refreshMap();
           var calls = res.engine && res.engine.calls != null ? " across " + res.engine.calls + " AI call(s)" : "";
-          setStatus((res.suggestions || []).length + " exact word removal(s)" + calls + ". Click red text to reject one, or drag to refine.");
-          toast((res.suggestions || []).length + " AI-Lite word suggestion(s) ready to review.", "success");
+          var deferred = res.deferred || [];
+          el.v2Deferred.hidden = !deferred.length;
+          el.v2Deferred.textContent = deferred.length ? deferred.length + " passage(s) left unchanged" + (res.applied ? " (original timeline times)" : "") + ": " + deferred.map(function (d) {
+            var w = state.words[d.startWord];
+            return (w ? mmss(w.startSec) + " — " : "") + d.reason;
+          }).join(" | ") : "";
+          if (res.applied) {
+            state.undoAvailable = false; Silence.clearUndoable(); Retake.clearUndoable();
+            state.loaded = false; state.reviewId = null; prepareWords([]); state.sentences = []; state.liveMap = {}; render();
+            var msg = res.applied.verified ? res.applied.ranges + " cut(s) applied, " + res.applied.markers + " review marker(s) in “" + res.applied.sequence + "”. Original preserved. Open Window > Markers to review." : res.applied.error;
+            if (res.applied.verified) {
+              el.v2Deferred.hidden = !res.reviewMarkers || !res.reviewMarkers.length;
+              el.v2Deferred.textContent = (res.reviewMarkers || []).map(function (m) { return mmss(m.startSec) + " — " + m.comment.split("\n")[1]; }).join(" | ");
+            }
+            setStatus(msg, !res.applied.verified); toast(msg, res.applied.verified ? "success" : "error");
+          } else {
+            setStatus((res.suggestions || []).length + " eligible cut suggestion(s)" + calls + "; " + deferred.length + " passage(s) left for review. Red text is selected for removal.");
+            toast("Retake analysis finished. No timeline changes.", "success");
+          }
         },
         function (err) {
-          setLoading(el.v2AnalyzeBtn, false, "AI word cuts"); setBusy(false);
+          setLoading(el.v2AnalyzeBtn, false, "Analyze retakes"); setBusy(false);
           var cancelled = /cancel/i.test(err.message);
           setStatus(cancelled ? "AI cancelled." : err.message, !cancelled);
         }
@@ -2195,6 +2238,7 @@
       }
       for (var s = 0; s < suggestions.length; s++) {
         var sug = suggestions[s];
+        if (sug.boundaryNote) sug = Object.assign({}, sug, { reason: (sug.reason || "retake") + " " + sug.boundaryNote });
         state.suggestions[sug.id] = { id: sug.id, accepted: sug.accepted !== false, reason: sug.reason || "duplicate take" };
         for (var j = sug.startWord; j <= sug.endWord; j++) {
           var w = wordByIndex(j); if (!w || w.manual) continue;
@@ -2349,6 +2393,7 @@
       setBusyBar("v2", state.busy);
       el.v2LoadBtn.disabled = !connected() || state.busy;
       el.v2AnalyzeBtn.disabled = !connected() || state.busy;
+      el.v2AutoBtn.disabled = !connected() || state.busy;
       el.v2StopBtn.style.display = state.busy ? "" : "none";
       el.v2ApplyBtn.disabled = !connected() || state.busy || !cutRanges().length;
       el.v2UndoBtn.style.display = state.undoAvailable && !state.busy ? "" : "none";
@@ -2371,7 +2416,7 @@
         html += '<span class="v2-time" data-act="v2seek" data-word="' + first.index + '" title="Jump the playhead here">' + mmss(time) + '</span><span class="v2-prose">';
         for (var j = sentence.startWord; j <= sentence.endWord; j++) {
           var w = wordByIndex(j); if (!w) continue;
-          var classes = "v2-word" + (w.decision === "cut" ? " cut" : "") + (w.suggestionId != null ? " suggested" : "") + (w.type === "audio_event" ? " v2-event" : "") + (isAbsent(w) ? " absent" : "") + (state.currentWord === w.index ? " current" : "");
+          var classes = "v2-word" + (w.reviewState === "REVIEW" ? " needs-review" : "") + (w.decision === "cut" ? " cut" : "") + (w.suggestionId != null ? " suggested" : "") + (w.type === "audio_event" ? " v2-event" : "") + (isAbsent(w) ? " absent" : "") + (state.currentWord === w.index ? " current" : "");
           var tip = w.reason ? esc(w.reason + (w.suggestionId != null ? " — click to accept/reject this suggestion" : "")) : "Drag to select this word";
           html += '<span class="' + classes + '" data-word="' + w.index + '"' + (w.suggestionId != null ? ' data-sug="' + w.suggestionId + '"' : "") + ' data-tip="' + tip + '">' + esc(w.text) + '</span> ';
         }
@@ -2385,7 +2430,8 @@
     function wire() {
       cache(); loadFollow(); el.v2Follow.checked = state.follow;
       el.v2LoadBtn.addEventListener("click", loadTranscript);
-      el.v2AnalyzeBtn.addEventListener("click", analyze);
+      el.v2AnalyzeBtn.addEventListener("click", function () { analyze(false); });
+      el.v2AutoBtn.addEventListener("click", function () { analyze(true); });
       el.v2StopBtn.addEventListener("click", stop);
       el.v2ApplyBtn.addEventListener("click", applyCuts);
       el.v2UndoBtn.addEventListener("click", undo);

@@ -83,6 +83,10 @@ export async function getTimeline(ctx, params = {}) {
     const speed = c.speed != null ? c.speed : durationSeconds > 0 ? sourceSpan / durationSeconds : 1;
     return {
       id: c.id,
+      trackLocked: c.trackLocked,
+      speedReversed: c.speedReversed,
+      disabled: c.disabled,
+      transitionCount: c.transitionCount,
       name: c.name,
       track: c.trackType.toUpperCase().charAt(0) + (c.trackIndex + 1),
       trackType: c.trackType,
@@ -112,6 +116,8 @@ export async function getTimeline(ctx, params = {}) {
   return {
     sequence: {
       name: seq.name,
+      id: seq.id,
+      captionTrackCount: seq.captionTrackCount,
       frameRate: round3(fps),
       dropFrame: df,
       timebase: tb,

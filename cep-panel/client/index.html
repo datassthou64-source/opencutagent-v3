@@ -70,14 +70,15 @@
           <div class="pop-title">Transcription</div>
           <label class="pop-row"><span>Model</span>
             <select id="sttModel">
+              <option value="scribe_v2">ElevenLabs Scribe v2 (default, verbatim)</option>
               <option value="tiny.en">Whisper tiny.en (fastest)</option>
               <option value="base.en">Whisper base.en</option>
-              <option value="small.en">Whisper small.en (default)</option>
+              <option value="small.en">Whisper small.en</option>
               <option value="medium.en">Whisper medium.en</option>
               <option value="large-v3">Whisper large-v3 (most accurate)</option>
             </select>
           </label>
-          <div class="pop-hint">Local whisper model used by Load (runs on this computer, no API key, no cost). Bigger models are more accurate but slower. Already-transcribed audio stays cached; Clear cache to re-transcribe with a different model.</div>
+          <div class="pop-hint">Scribe v2 keeps every word, including false starts and stutters, which retakes need (needs an ElevenLabs key, about $0.22 per hour of audio on the timeline). Whisper runs free on this computer but can skip whole passages. Each engine keeps its own cache.</div>
         </div>
         <div class="pop-sec">
           <div class="pop-title">Storage</div>
@@ -406,14 +407,15 @@
       <!-- ===================== RETAKE V2 ===================== -->
       <section id="tab-retake-v2" class="tabpane hidden">
         <div class="v2-toolbar">
-          <button id="v2LoadBtn" class="primary" disabled data-tip="Loads the cached local Whisper transcript while preserving every word and its source timestamp.">
+          <button id="v2LoadBtn" disabled data-tip="Loads the cached local Whisper transcript while preserving every word and its source timestamp.">
             <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 13h6M9 17h6"/></svg>
             <span class="lbl">Load transcript</span>
           </button>
-          <button id="v2AnalyzeBtn" disabled data-tip="AI-Lite reviews the entire transcript in compact overlapping passes, then makes exact word-level removal suggestions using the selected model (Sonnet when Latest) at low effort.">
+          <button id="v2AnalyzeBtn" disabled data-tip="Keeps the last recorded take in each retake group, including when it drops earlier wording; flags uncertain matches. Does not edit the timeline.">
             <svg class="ic" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z"/><path d="M19 14l.6 1.9L21.5 16.5l-1.9.6L19 19l-.6-1.9L16.5 16.5l1.9-.6z"/></svg>
-            <span class="lbl">AI word cuts</span>
+            <span class="lbl">Analyze retakes</span>
           </button>
+          <button id="v2AutoBtn" class="primary" disabled data-tip="One click: analyze, check audio boundaries, apply eligible cuts on a duplicate, and mark uncertain passages for review. Unsupported layouts get review markers without cuts."><span class="lbl">Auto-remove retakes</span></button>
           <button id="v2StopBtn" class="danger" style="display:none">
             <svg class="ic" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
             Stop
@@ -427,6 +429,7 @@
           </label>
         </div>
 
+        <div id="v2Deferred" class="statusbar" hidden></div>
         <div id="v2SelectionBar" class="v2-selectionbar" hidden>
           <span id="v2SelectionLabel">0 words selected</span>
           <span class="v2-selection-actions">
@@ -445,7 +448,7 @@
         </div>
 
         <div class="footer v2-footer">
-          <div class="v2-help">AI-Lite always reviews the full transcript · red = approved word cut · click to reject · drag words to refine</div>
+          <div class="v2-help">Last take wins · Auto-remove edits a duplicate · uncertain footage stays with review markers</div>
           <label class="chk" data-tip="Closes the gaps left by removed word ranges, shifting everything after them left."><input type="checkbox" id="v2RemoveGaps" checked /> Remove gaps when applying (ripple)</label>
           <button id="v2UndoBtn" class="undo-btn" style="display:none" data-tip="Restores the timeline to how it was before the last V2 apply.">
             <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 3L3 13"/></svg>
