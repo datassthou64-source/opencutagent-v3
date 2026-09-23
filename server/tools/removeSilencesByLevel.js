@@ -11,7 +11,7 @@ export default {
   inputSchema: {
     type: "object",
     properties: {
-      clip_id: { type: "string", description: 'Clip id, or "all" (default) for every video clip with media.' },
+      clip_id: { type: "string", description: 'Clip id, or "all" (default) for every enabled clip on audio track A1.' },
       dry_run: { type: "boolean", description: "If true, return the cut list WITHOUT editing. Default true — always preview first." },
       threshold_db: { type: "number", description: "Noise Threshold in dB (negative). Default: auto-estimated from the audio." },
       min_silence_ms: { type: "integer", description: "Remove Silences Longer Than (ms). Default 120." },
