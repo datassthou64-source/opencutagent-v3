@@ -21,15 +21,19 @@ class CancelledError extends Error {
   }
 }
 
-/** Pick the clips the silence tab operates on (video clips with media, 100% speed). */
+/**
+ * Pick the clips the silence tab operates on: the enabled clips on audio track
+ * A1 only, so a replaced/re-recorded A1 is what gets measured — never the
+ * video's embedded audio. Cuts still razor every track (removeRangesBatch).
+ */
 function selectClips(timeline, clipId) {
   if (clipId && clipId !== "all") {
     const c = timeline.clips.find((x) => x.id === clipId);
     if (!c) throw new ToolError(`No clip "${clipId}". Call ppro_get_timeline_state for valid ids.`);
     return [c];
   }
-  let clips = timeline.clips.filter((c) => c.hasMedia && c.trackType === "video");
-  if (clips.length === 0) clips = timeline.clips.filter((c) => c.hasMedia);
+  const clips = timeline.clips.filter((c) => c.trackType === "audio" && c.trackIndex === 0 && c.hasMedia && !c.disabled);
+  if (clips.length === 0) throw new ToolError("No enabled audio clips on A1. Put the audio you want scanned on track A1.");
   return clips;
 }
 
@@ -49,6 +53,8 @@ export async function buildLevels(ctx, opts = {}, onProgress = () => {}) {
   const skipped = [];
   const allDb = [];
   let hopSec = 0.02;
+  // A refresh re-extracts each source ONCE per scan; the rest of its clips hit the memo.
+  const refreshed = new Set();
 
   for (const clip of targets) {
     if (isAborted(ctx)) throw new CancelledError();
@@ -57,7 +63,9 @@ export async function buildLevels(ctx, opts = {}, onProgress = () => {}) {
       continue;
     }
     onProgress(`Analyzing loudness: ${clip.mediaPath.split(/[\\\/]/).pop()}…`);
-    const { envelope } = await getLevels(clip.mediaPath, { cacheDir: ctx.cacheDir, refresh: !!opts.refresh });
+    const refresh = !!opts.refresh && !refreshed.has(clip.mediaPath);
+    refreshed.add(clip.mediaPath);
+    const { envelope } = await getLevels(clip.mediaPath, { cacheDir: ctx.cacheDir, refresh });
     hopSec = envelope.hopSec;
     const slice = sliceEnvelope(envelope, clip.sourceIn.seconds, clip.sourceOut.seconds);
     for (const d of slice.db) allDb.push(d);

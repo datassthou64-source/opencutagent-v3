@@ -10,7 +10,7 @@ export default {
   inputSchema: {
     type: "object",
     properties: {
-      clip_id: { type: "string", description: 'Clip id (e.g. "V1.0") or "all" (default — every video clip with media).' },
+      clip_id: { type: "string", description: 'Clip id (e.g. "A1.0") or "all" (default — every enabled clip on audio track A1).' },
       refresh: { type: "boolean", description: "Re-extract levels even if cached (use if the source file changed)." },
       set_threshold_db: {
         type: "number",
