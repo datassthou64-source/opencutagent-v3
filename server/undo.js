@@ -12,16 +12,24 @@
 import { getTimeline } from "./tools/util.js";
 import { reverseMarkerMoves } from "./silences.js";
 
+/** Clips undo can rebuild: source media, or a nested sequence it can identify. */
+const restorable = (c) => c.hasMedia || (c.isNested && !!c.nestId);
+
 /** Capture the pre-apply timeline so it can be restored later. */
 export function snapshotTimeline(timeline) {
   return {
     sequenceName: timeline.sequence.name,
+    // Items undo cannot rebuild (titles, unidentifiable nests). Restoring the rest
+    // would leave these cut and out of sync, so undo refuses instead.
+    unrestorable: timeline.clips.filter((c) => !restorable(c)).length,
     clips: timeline.clips
-      .filter((c) => c.hasMedia)
+      .filter(restorable)
       .map((c) => ({
         trackType: c.trackType,
         trackIndex: c.trackIndex,
         mediaPath: c.mediaPath,
+        // Nested/multicam sequences have no media path; the host matches them by this.
+        nestId: c.hasMedia ? null : c.nestId,
         startSec: c.start.seconds,
         endSec: c.end.seconds,
         inSec: c.sourceIn.seconds,
@@ -57,6 +65,10 @@ export async function restoreUndo(ctx) {
   if (!hasUndo(ctx)) throw new Error("Nothing to undo.");
   const { snapshot: snap, kind } = ctx.undo;
 
+  if (snap.unrestorable > 0) {
+    return { ok: false, kind, message: `Can't auto-undo: ${snap.unrestorable} clip(s) have no source media the panel can rebuild (title, graphic or nest). Press Cmd+Z in Premiere.` };
+  }
+
   // The in/out/start/end setters can't faithfully rebuild speed-changed clips.
   if (snap.clips.some((c) => c.speedIsNormal === false)) {
     return { ok: false, kind, message: "Can't auto-undo a sequence with speed-changed clips. Press Cmd+Z in Premiere." };
@@ -85,7 +97,7 @@ export async function restoreUndo(ctx) {
   let verified = false;
   try {
     const after = await getTimeline(ctx);
-    verified = after.clips.filter((c) => c.hasMedia).length === snap.clips.length;
+    verified = after.clips.filter(restorable).length === snap.clips.length;
   } catch {
     /* verification is best-effort */
   }

@@ -95,6 +95,7 @@ export async function getTimeline(ctx, params = {}) {
       mediaPath: c.mediaPath || null,
       hasMedia: !!c.mediaPath,
       isNested: c.isNested === true,
+      nestId: c.isNested === true && c.nestId ? String(c.nestId) : null,
       start: addTC(c.start),
       end: addTC(c.end),
       sourceIn: addTC(c.inPoint),

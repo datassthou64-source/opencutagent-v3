@@ -256,6 +256,7 @@ $.editagent = (function () {
           itemIndex: j,
           mediaPath: mediaPath,
           isNested: nested,
+          nestId: nested ? nestIdOf(clip) : "",
           start: { ticks: String(clip.start.ticks), seconds: startSec },
           end: { ticks: String(clip.end.ticks), seconds: endSec },
           inPoint: { ticks: String(clip.inPoint.ticks), seconds: clip.inPoint.seconds },
@@ -731,6 +732,19 @@ $.editagent = (function () {
   }
 
   // Does the track's current layout already equal the snapshot originals?
+  // What a clip plays: its media file, or for a nested/multicam sequence (no media
+  // path) the project item it points at. Undo matches clip pieces by this.
+  function nestIdOf(clip) {
+    try {
+      if (clip.projectItem && !clip.projectItem.getMediaPath() && clip.projectItem.isSequence()) return String(clip.projectItem.nodeId || "");
+    } catch (e) {}
+    return "";
+  }
+
+  function sameSource(cur, o) {
+    return o.nestId ? cur.nestId === o.nestId : samePath(cur.mediaPath, o.mediaPath);
+  }
+
   function trackMatches(cur, originals) {
     if (cur.length !== originals.length) return false;
     var used = [];
@@ -739,7 +753,7 @@ $.editagent = (function () {
       var found = false;
       for (var m = 0; m < cur.length; m++) {
         if (used[m]) continue;
-        if (samePath(cur[m].mediaPath, o.mediaPath) && Math.abs(cur[m].inP - o.inSec) < 0.05 && Math.abs(cur[m].outP - o.outSec) < 0.05) {
+        if (sameSource(cur[m], o) && Math.abs(cur[m].inP - o.inSec) < 0.05 && Math.abs(cur[m].outP - o.outSec) < 0.05) {
           used[m] = true;
           found = true;
           break;
@@ -786,7 +800,7 @@ $.editagent = (function () {
         var c = track.clips[j];
         var mp = "";
         try { if (c.projectItem) mp = c.projectItem.getMediaPath(); } catch (e) {}
-        cur.push({ clip: c, mediaPath: mp, inP: c.inPoint.seconds, outP: c.outPoint.seconds, used: false });
+        cur.push({ clip: c, mediaPath: mp, nestId: mp ? "" : nestIdOf(c), inP: c.inPoint.seconds, outP: c.outPoint.seconds, used: false });
       }
 
       if (trackMatches(cur, originals)) continue; // unchanged track — leave it alone
@@ -800,7 +814,7 @@ $.editagent = (function () {
           var it = cur[m];
           if (it.used) continue;
           // a kept piece from the same media whose source range is within the original
-          if (samePath(it.mediaPath, o.mediaPath) && it.inP >= o.inSec - 0.5 && it.outP <= o.outSec + 0.5) {
+          if (sameSource(it, o) && it.inP >= o.inSec - 0.5 && it.outP <= o.outSec + 0.5) {
             it.used = true;
             if (!survivor) survivor = it;
             else extras.push(it);

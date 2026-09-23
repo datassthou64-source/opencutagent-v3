@@ -61,6 +61,29 @@ check("undo failure: ok=false", uf.ok === false, uf);
 check("undo failure: message mentions Cmd+Z", /Cmd\+Z/.test(uf.message), uf);
 check("undo failure: undo point retained", hasUndo(ctxF), "cleared");
 
+// --- nested/multicam V1 over an external A1 (2026-09-23 Master Youtube 1) ---
+{
+  const T = (sec) => ({ seconds: sec, ticks: String(sec * 254016000000) });
+  const nest = { trackType: "video", trackIndex: 0, mediaPath: null, hasMedia: false, isNested: true, nestId: "000f4240", speedIsNormal: true, start: T(0), end: T(30), sourceIn: T(583), sourceOut: T(613) };
+  const mp3 = { trackType: "audio", trackIndex: 0, mediaPath: "/m.mp3", hasMedia: true, isNested: false, nestId: null, speedIsNormal: true, start: T(0), end: T(30), sourceIn: T(0), sourceOut: T(30) };
+  const ns = snapshotTimeline({ sequence: RAW.sequence, clips: [nest, mp3] });
+  check("nested V1 is in the undo snapshot, keyed by its project item", ns.clips.length === 2 && ns.clips.some((c) => c.nestId === "000f4240" && c.inSec === 583), ns.clips);
+  check("nothing unrestorable in nest + mp3 layout", ns.unrestorable === 0, ns);
+  const ctxNest = makeCtx((a) => (a === "restoreTimeline" ? { ok: true, restoredTracks: 2 } : { ok: true }));
+  ctxNest.undo = { kind: "silence", snapshot: ns, meta: {} };
+  const un = await restoreUndo(ctxNest);
+  const sent = ctxNest.calls.find((c) => c.a === "restoreTimeline");
+  check("undo sends the nested clip to the host", sent && sent.clips.length === 2 && sent.clips.some((c) => c.nestId === "000f4240"), sent);
+  check("undo on nest + mp3 reports ok", un.ok === true, un);
+
+  const title = { ...nest, trackIndex: 1, isNested: false, nestId: null };
+  const bad = snapshotTimeline({ sequence: RAW.sequence, clips: [nest, mp3, title] });
+  const ctxBad = makeCtx((a) => (a === "restoreTimeline" ? { ok: true, restoredTracks: 2 } : { ok: true }));
+  ctxBad.undo = { kind: "silence", snapshot: bad, meta: {} };
+  const ub = await restoreUndo(ctxBad);
+  check("a clip undo can't rebuild refuses the whole undo (no half-restore)", ub.ok === false && /Cmd\+Z/.test(ub.message) && !ctxBad.calls.some((c) => c.a === "restoreTimeline"), ub);
+}
+
 // --- nothing to undo ---
 const ctxN = makeCtx();
 let threw = false;
