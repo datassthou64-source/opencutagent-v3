@@ -734,3 +734,7 @@ button.reinsert:hover:not(:disabled) { background: var(--accent-hover); border-c
   *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
   .topbar.active .topbar-fill { opacity: 1; left: 0; width: 100%; }
 }
+
+/* Preserved passages that require an editorial or audio-boundary decision. */
+.v2-word.needs-review { border-bottom: 2px dotted #dba85a; }
+#v2Deferred { white-space: normal; max-height: 150px; overflow-y: auto; }

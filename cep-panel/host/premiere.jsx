@@ -235,7 +235,18 @@ $.editagent = (function () {
         try {
           if (clip.projectItem) mediaPath = clip.projectItem.getMediaPath();
         } catch (e) {}
+        var locked = null, disabled = null, transitions = null, speed = null, reversed = null;
+        try { locked = !!track.isLocked(); } catch (eLock) {}
+        try { disabled = !!clip.disabled; } catch (eDisabled) {}
+        try { transitions = track.transitions.numItems; } catch (eTransitions) {}
+        try { speed = clip.getSpeed(); } catch (eSpeed) {}
+        try { reversed = !!clip.isSpeedReversed(); } catch (eReverse) {}
         clipsOut.push({
+          trackLocked: locked,
+          disabled: disabled,
+          transitionCount: transitions,
+          speed: speed,
+          speedReversed: reversed,
           id: prefix + (i + 1) + "." + j,
           name: clip.name,
           trackType: type,
@@ -265,6 +276,8 @@ $.editagent = (function () {
     return {
       sequence: {
         name: seq.name,
+        id: String(seq.sequenceID),
+        captionTrackCount: seq.captionTracks ? seq.captionTracks.numTracks : 0,
         timebase: timebase,
         frameRate: fps,
         zeroPointTicks: String(seq.zeroPoint),
@@ -277,6 +290,43 @@ $.editagent = (function () {
       clips: clips,
       gaps: gaps
     };
+  }
+
+  // Validate the expected geometry in the SAME synchronous host operation as
+  // the mutation, so an intervening manual edit cannot redirect the cuts.
+  function assertRetakeGeometry(p, cutting) {
+    var seq = requireSeq();
+    if (p.expectedSequenceId && String(seq.sequenceID) !== p.expectedSequenceId) throw new Error("Active sequence changed; no operation performed.");
+    if (p.expectedTimebase && String(seq.timebase) !== p.expectedTimebase) throw new Error("Sequence timebase changed; no operation performed.");
+    if (!p.expectedGeometry) return;
+    var current = getTimelineState().clips, wanted = p.expectedGeometry, byKey = {}, i;
+    if (current.length !== wanted.length) throw new Error("Timeline changed before the operation; no operation performed.");
+    for (i = 0; i < wanted.length; i++) {
+      var e = wanted[i];
+      byKey[e.trackType + ":" + e.trackIndex + ":" + e.start] = e;
+    }
+    for (i = 0; i < current.length; i++) {
+      var c = current[i], k = c.trackType + ":" + c.trackIndex + ":" + c.start.ticks, target = byKey[k];
+      if (!target || (c.mediaPath || null) !== target.mediaPath || String(c.end.ticks) !== target.end || String(c.inPoint.ticks) !== target.sourceIn || String(c.outPoint.ticks) !== target.sourceOut) throw new Error("Timeline geometry changed; no operation performed.");
+      if (cutting && (c.trackLocked !== false || c.disabled !== false || c.speedReversed !== false || c.transitionCount !== 0)) throw new Error("Track state changed; no cuts performed.");
+      delete byKey[k];
+    }
+  }
+
+  function duplicateRetakeSequence(p) {
+    var original = requireSeq();
+    if (String(original.sequenceID) !== p.expectedSequenceId) throw new Error("Active sequence changed before duplication.");
+    var known = {}, sequences = app.project.sequences, i;
+    for (i = 0; i < sequences.numSequences; i++) known[String(sequences[i].sequenceID)] = true;
+    original.clone(); // The return value varies by Premiere version; identify new IDs instead.
+    var found = [];
+    for (i = 0; i < sequences.numSequences; i++) if (!known[String(sequences[i].sequenceID)]) found.push(sequences[i]);
+    if (found.length !== 1) throw new Error("Could not uniquely identify the duplicate; no cuts performed.");
+    var copy = found[0];
+    copy.name = original.name + " - Retakes " + new Date().getTime();
+    app.project.openSequence(copy.sequenceID);
+    if (String(requireSeq().sequenceID) !== String(copy.sequenceID)) throw new Error("Could not activate the duplicate; no cuts performed.");
+    return { sequenceId: String(copy.sequenceID), name: copy.name };
   }
 
   function trimClip(p) {
@@ -447,7 +497,9 @@ $.editagent = (function () {
   // p.ranges must be ascending and non-overlapping (the server merges).
 
   function removeRangesBatch(p) {
+    assertRetakeGeometry(p, true);
     var seq = requireSeq();
+    if (p.expectedSequenceId && String(seq.sequenceID) !== p.expectedSequenceId) throw new Error("Active sequence changed; no operation performed.");
     var timebase = Number(seq.timebase);
     var fps = TPS / timebase;
     var drop = detectDropFrame(seq, fps);
@@ -542,7 +594,9 @@ $.editagent = (function () {
   // failed to razor/delete keeps its span and nothing mis-shifts (matches the
   // old per-track ripple semantics). Pre-existing gaps are untouched.
   function closeRangeGaps(p) {
+    assertRetakeGeometry(p, true);
     var seq = requireSeq();
+    if (p.expectedSequenceId && String(seq.sequenceID) !== p.expectedSequenceId) throw new Error("Active sequence changed; no operation performed.");
     var timebase = Number(seq.timebase);
     var ranges = p.ranges || []; // ascending, non-overlapping
     // Integer frames throughout: clip edges come from ticks and the shift is a
@@ -1003,7 +1057,7 @@ $.editagent = (function () {
 
     // Idempotent: drop our previous markers first so re-running replaces cleanly.
     var cleared = deleteTaggedMarkers(markers, sentinel);
-    cleared += deleteTaggedMarkers(markers, "EditAgent"); // pre-rename markers
+    if (!p.scopeOnly) cleared += deleteTaggedMarkers(markers, "EditAgent"); // pre-rename markers
 
     var created = 0;
     for (var i = 0; i < list.length; i++) {
@@ -1018,6 +1072,31 @@ $.editagent = (function () {
       created++;
     }
     return { created: created, cleared: cleared };
+  }
+
+  function applyReviewMarkers(p) {
+    assertRetakeGeometry(p, false);
+    if (p.sentinel !== "OpenCutAgent:RetakeReview:v1") throw new Error("Invalid review marker scope.");
+    p.scopeOnly = true;
+    var list = p.markers || [], i;
+    // Validate everything before clearing the old run's markers.
+    for (i = 0; i < list.length; i++) {
+      if (!isFinite(list[i].startSec) || !isFinite(list[i].endSec) || list[i].startSec < 0 || list[i].endSec < list[i].startSec || String(list[i].comment).indexOf(p.sentinel) !== 0) throw new Error("Invalid review marker.");
+    }
+    var result = applyEditMarkers(p), seq = requireSeq();
+    var actual = collectTaggedMarkers(seq.markers, p.sentinel), records = [];
+    for (i = 0; i < actual.length; i++) {
+      try { records.push({ startSec: actual[i].start.seconds, endSec: actual[i].end.seconds, name: actual[i].name, comment: actual[i].comments }); } catch (e) {}
+    }
+    var sort = function(a,b) { return a.startSec - b.startSec || a.endSec - b.endSec || (a.comment < b.comment ? -1 : a.comment > b.comment ? 1 : 0); };
+    records.sort(sort); list.sort(sort);
+    var ok = records.length === list.length && result.created === list.length;
+    var epsilon = Number(seq.timebase) / TPS;
+    for (i = 0; ok && i < list.length; i++) {
+      ok = Math.abs(records[i].startSec - list[i].startSec) <= epsilon && Math.abs(records[i].endSec - list[i].endSec) <= epsilon && records[i].name === list[i].name && records[i].comment === list[i].comment;
+    }
+    result.verified = ok;
+    return result;
   }
 
   // ---- XML round-trip export (fast apply that PRESERVES effects) ----
@@ -1096,6 +1175,7 @@ $.editagent = (function () {
     trimClip: trimClip,
     removeGaps: removeGaps,
     removeRange: removeRange,
+    duplicateRetakeSequence: duplicateRetakeSequence,
     removeRangesBatch: removeRangesBatch,
     closeRangeGaps: closeRangeGaps,
     muteRange: muteRange,
@@ -1104,6 +1184,7 @@ $.editagent = (function () {
     reinsertSegment: reinsertSegment,
     restoreTimeline: restoreTimeline,
     applyEditMarkers: applyEditMarkers,
+    applyReviewMarkers: applyReviewMarkers,
     clearEditMarkers: clearEditMarkers,
     exportXmlSequence: exportXmlSequence,
     importXmlSequence: importXmlSequence,

@@ -14,6 +14,7 @@ import { askClaude, THRESHOLD_SCHEMA, thresholdSystem, thresholdPrompt, analyzeR
 import { analyzeRetakesFast, retakeMode } from "../retakes/fast.js";
 import { analyzeRetakesWordAi } from "../retakes/word-ai.js";
 import { applyRetakeV2, reconcileRetakeV2 } from "../retake-v2.js";
+import { runReliableSession } from "../retakes/reliable-session.js";
 import { readUsage, recordUsage } from "../usage.js";
 
 // Model/effort come from the panel dropdowns; fall back to .env, then sane defaults.
@@ -23,6 +24,7 @@ function aiEffort(params) { return params.effort || liveEnv("EDITAGENT_AI_EFFORT
 // Register an abort token for a panel-initiated long op so the "cancel" RPC (a
 // separate concurrent message over the same socket) can stop it between steps.
 async function cancellable(ctx, fn) {
+  if (ctx.panelOp) throw new Error("Another editing operation is running. Wait or stop it before starting a new one.");
   const token = { aborted: false };
   ctx.panelOp = token;
   try {
@@ -465,6 +467,10 @@ async function aiRetakes(params, helpers, ctx) {
 }
 
 /** V2 AI-Lite: Claude sees the whole transcript, then returns exact word ranges. */
+async function reliableRetakesV2(params, helpers, ctx) {
+  return cancellable(ctx, token => runReliableSession(ctx, params, helpers.progress, token));
+}
+
 async function aiRetakesV2(params, helpers, ctx) {
   return cancellable(ctx, async (token) => {
     let review = ctx.review;
@@ -623,6 +629,13 @@ const ENV_SPECS = [
   { key: "EDITAGENT_AI_CHUNK", def: "36", desc: "Segments per chunk when Analyze w/ Claude splits a long timeline into windows." },
   { key: "EDITAGENT_AI_CHUNK_CONTEXT", def: "14", desc: "Extra context segments each chunk sees on both sides of its window." },
   { key: "EDITAGENT_AI_CONCURRENCY", def: "4", desc: "How many analysis chunks run at the same time." },
+  { key: "EDITAGENT_TRANSCRIBE_MODEL", def: "scribe_v2", desc: "Transcription model when the panel doesn't send one: scribe_v2 (ElevenLabs, verbatim) or a whisper model (tiny.en ... large-v3). Blank = Scribe if a key is set, else whisper. The Transcription dropdown above overrides this." },
+  { key: "EDITAGENT_SCRIBE_RATE", def: "0.22", desc: "ElevenLabs Scribe price in USD per hour of audio, used only for the Usage log's cost column." },
+  { key: "EDITAGENT_RETAKE_ENGINE", def: "v3", desc: "Retake V2 Auto-remove engine. v3 = one Claude call per 20-minute part, code checks (fast, few tokens). reliable = the older multi-call chain with a Claude check on every edit (slow, many tokens)." },
+  { key: "EDITAGENT_RETAKE_WINDOW_MIN", def: "20", desc: "v3: minutes of recording per Claude call. Parts run in parallel. 0 = the whole recording in one call." },
+  { key: "EDITAGENT_RETAKE_OVERLAP_MIN", def: "2", desc: "v3: minutes of overlap shown around each part so a retake on a boundary is seen whole." },
+  { key: "EDITAGENT_RETAKE_CHUNK_PAUSE", def: "0.3", desc: "v3: a pause at least this many seconds long starts a new speech chunk (the unit Claude cuts)." },
+  { key: "EDITAGENT_RETAKE_CONCURRENCY", def: "4", desc: "How many retake Claude calls run at the same time." },
   { key: "EDITAGENT_WHISPER_MODEL", def: "small.en", desc: "Local whisper model for transcription (tiny.en, base.en, small.en, medium.en, large-v3). The Transcription dropdown above overrides this." },
   { key: "EDITAGENT_PHRASE_GAP_SEC", def: "0.5", desc: "Retakes: split a clip into a new segment on an internal pause this long (seconds). Smaller = finer keep/cut chunks." },
   { key: "EDITAGENT_PHRASE_SPLIT_SENTENCE", def: "1", desc: "Retakes: also split segments at sentence punctuation (. ? !) so each is about one sentence. Set 0 to split on pauses only." },
@@ -689,7 +702,7 @@ async function ping() {
   return { ok: true };
 }
 
-const HANDLERS = { ping, cancel, loadSegments, loadRetakeV2, retakeV2Map, applyRetakeV2Ranges, applyDecisions, softApply, clearMarkers, exportTranscript, timelineMap, reinsertSegment, analyzeLevels, applySilences, aiThreshold, aiRetakes, aiRetakesV2, undoLastApply, undoStatus, cacheInfo, clearCache, usageLog, keyStatus, setApiKey, envList, setEnv };
+const HANDLERS = { ping, cancel, loadSegments, loadRetakeV2, retakeV2Map, applyRetakeV2Ranges, applyDecisions, softApply, clearMarkers, exportTranscript, timelineMap, reinsertSegment, analyzeLevels, applySilences, aiThreshold, aiRetakes, aiRetakesV2, reliableRetakesV2, undoLastApply, undoStatus, cacheInfo, clearCache, usageLog, keyStatus, setApiKey, envList, setEnv };
 
 export function createRpcDispatcher(ctx) {
   return async (method, params, helpers) => {

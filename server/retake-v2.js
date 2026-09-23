@@ -2,8 +2,9 @@
 // Classic): both use the same cached transcript and the same batched Premiere
 // cut engine, but V2 never reduces an edit decision to a phrase/card boundary.
 import { getTimeline, round3 } from "./tools/util.js";
-import { sourceRangeToTimelineFrames } from "./transcription/timecode.js";
+import { sourceRangeToTimelineFrames, sourceSecToTimeline } from "./transcription/timecode.js";
 import { applyRangesBatched } from "./silences.js";
+import { timelineFingerprint } from "./retakes/timeline-safety.js";
 import { captureUndo } from "./undo.js";
 
 const SENTENCE_END = /[.?!]["'”’)\]]*$/;
@@ -89,12 +90,12 @@ export function buildRetakeV2Document(clipEntries, sequence, opts = {}) {
         mediaPath: clip.mediaPath,
         trackType: clip.trackType,
         trackIndex: clip.trackIndex,
-        sourceInSec: round3(srcStart),
-        sourceOutSec: round3(srcEnd),
+        sourceInSec: srcStart,
+        sourceOutSec: srcEnd,
         startFrame: mapped ? mapped.startFrame : clip.start.frame,
         endFrame: mapped ? mapped.endFrame : clip.start.frame + 1,
-        startSec: mapped ? round3(mapped.startSeconds) : round3(clip.start.seconds),
-        endSec: mapped ? round3(mapped.endSeconds) : round3(clip.start.seconds),
+        startSec: mapped ? mapped.startSeconds : clip.start.seconds,
+        endSec: mapped ? mapped.endSeconds : clip.start.seconds,
         text: String(token.text || "").trim(),
         type: token.type || "word",
         speaker,
@@ -236,7 +237,35 @@ export function planSafeWordCuts(words, ranges, timeline, opts = {}) {
     for (const clip of chosen) {
       const mapped = sourceRangeToTimelineFrames(plan.startSourceSec, plan.endSourceSec, clip, timebase);
       if (mapped && mapped.endFrame > mapped.startFrame) {
-        frames.push({ startFrame: mapped.startFrame, endFrame: mapped.endFrame, startWord: plan.startWord, endWord: plan.endWord });
+        if (opts.protectKeptSpeech) {
+          const first = words[plan.startWord], last = words[plan.endWord];
+          const prev = words[plan.startWord - 1], next = words[plan.endWord + 1];
+          const tb = BigInt(timebase);
+          const tick = sec => {
+            // A clipped token at an exact clip edge must use the original tick,
+            // not a float-seconds round trip that can produce a one-tick error.
+            if (sec === clip.sourceIn.seconds) return BigInt(clip.start.ticks);
+            if (sec === clip.sourceOut.seconds) return BigInt(clip.end.ticks);
+            return BigInt(sourceSecToTimeline(sec, clip, timebase).ticks);
+          };
+          const floor = n => Number(n >= 0n ? n / tb : -((-n + tb - 1n) / tb));
+          const ceil = n => -floor(-n);
+          const lo = prev && prev.clipKey === first.clipKey ? Math.max(clip.sourceIn.seconds, prev.sourceOutSec) : clip.sourceIn.seconds;
+          const hi = next && next.clipKey === last.clipKey ? Math.min(clip.sourceOut.seconds, next.sourceInSec) : clip.sourceOut.seconds;
+          const minStart = ceil(tick(lo)), maxStart = ceil(tick(first.sourceInSec));
+          const minEnd = floor(tick(last.sourceOutSec)), maxEnd = floor(tick(hi));
+          // Adjacent ASR words often share a fractional-frame timestamp. Preserve
+          // retained speech by snapping INWARD into discarded speech by <1 frame.
+          // Requiring both full discarded-word coverage and no retained-word overlap
+          // makes every shared non-frame boundary impossible. Larger overlaps still defer.
+          if (minStart > maxStart || minEnd > maxEnd) continue;
+          mapped.startFrame = Math.max(minStart, Math.min(maxStart, mapped.startFrame));
+          mapped.endFrame = Math.max(minEnd, Math.min(maxEnd, mapped.endFrame));
+          if (mapped.endFrame <= mapped.startFrame) continue;
+          mapped.inwardSnap = mapped.startFrame > floor(tick(first.sourceInSec)) || mapped.endFrame < ceil(tick(last.sourceOutSec));
+        }
+        frames.push({ startFrame: mapped.startFrame, endFrame: mapped.endFrame, startWord: plan.startWord, endWord: plan.endWord,
+          ...(mapped.inwardSnap ? { inwardSnap: true } : {}) });
       }
     }
   }
@@ -283,7 +312,10 @@ export async function reconcileRetakeV2(ctx, timeline = null) {
 export async function applyRetakeV2(ctx, ranges, { removeGaps = true, chunkSize } = {}, onProgress = () => {}) {
   if (!ctx.review || !Array.isArray(ctx.review.words)) throw new Error("No Retake V2 transcript loaded yet.");
   const timeline = await getTimeline(ctx); // fresh live geometry immediately before planning
-  const planned = planSafeWordCuts(ctx.review.words, ranges, timeline);
+  if (ctx.review.timelineFingerprint && ctx.review.timelineFingerprint !== timelineFingerprint(timeline)) {
+    throw new Error("Timeline changed since the transcript was loaded. Reload before applying word cuts.");
+  }
+  const planned = planSafeWordCuts(ctx.review.words, ranges, timeline, { protectKeptSpeech: ctx.review.reliableTiming === true });
   if (!planned.frames.length) {
     return { applied: 0, requested: 0, alreadyGone: planned.alreadyGone, appliedSec: 0, undoable: false, revision: ctx.state.revision };
   }

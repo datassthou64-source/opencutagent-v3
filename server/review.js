@@ -8,6 +8,7 @@ import { groupIntoPhrases, sliceWordsToWindow } from "./transcription/segments.j
 import { sourceRangeToTimelineFrames, sourceSecToTimeline, timelineFrameToSourceTicks } from "./transcription/timecode.js";
 import { captureUndo } from "./undo.js";
 import { applyRangesBatched } from "./silences.js";
+import { timelineFingerprint } from "./retakes/timeline-safety.js";
 import { buildRetakeV2Document } from "./retake-v2.js";
 
 // A clip is split into phrases on an internal pause >= this (sub-clip false
@@ -186,6 +187,7 @@ export async function buildReview(ctx, opts = {}, onProgress = () => {}) {
   ctx.reviewVersion = (ctx.reviewVersion || 0) + 1;
   ctx.review = {
     reviewId: `${seq.name}:${ctx.reviewVersion}`,
+    timelineFingerprint: timelineFingerprint(timeline),
     sequence: seq.name,
     frameRate: seq.frameRate,
     dropFrame: seq.dropFrame,
