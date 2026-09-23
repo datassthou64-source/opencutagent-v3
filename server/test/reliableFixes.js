@@ -4,6 +4,7 @@ import { validateDecisions } from "../retakes/reliable.js";
 import { shiftCutsToPauses } from "../retakes/reliable-session.js";
 import { markerLabel } from "../retakes/review-markers.js";
 import { findMicroRestarts } from "../retakes/stutters.js";
+import { requireSimpleTimeline, transcriptSourceClips, expectedGeometry } from "../retakes/timeline-safety.js";
 
 let failed = 0;
 const check = (name, ok) => { console.log(`${ok ? "PASS" : "FAIL"}  ${name}`); if (!ok) failed++; };
@@ -65,6 +66,32 @@ check("medium-confidence cut gets a medium marker", markerLabel({ replacements: 
 check("uncuttable stutter still gets a low marker", markerLabel({ group: 100394, category: "Audio boundary", replacements: [{}] }).name === "Stutter? (low)");
 const label = markerLabel({ reason: "Word references must be ordered inclusive indices within W0-W284; context cannot..." });
 check("validator prose never reaches a marker", label.name === "Pending review" && label.note === "Possible retake.");
+
+// 2026-09-23 Master Youtube 1: nested multicam on V1, external mp3 on A1 (one frame
+// shorter). Was refused as "Layout not supported"; A1 alone is the transcript.
+const TB = 10594584000n, tc = f => ({ ticks: String(BigInt(f) * TB), seconds: Number(BigInt(f) * TB) / 254016000000 });
+const clip = (trackType, trackIndex, name, mediaPath, s, e, src, extra = {}) => ({ trackType, trackIndex, name, mediaPath, hasMedia: !!mediaPath,
+  isNested: !mediaPath, start: tc(s), end: tc(e), sourceIn: tc(src), sourceOut: tc(src + e - s), speedIsNormal: true, speedReversed: false,
+  trackLocked: false, disabled: false, transitionCount: 0, ...extra });
+const nestTl = { sequence: { id: "s", timebase: String(TB), captionTrackCount: 0 }, clips: [
+  clip("video", 0, "Multicam setup", null, 0, 69539, 13990),
+  clip("audio", 0, "Master Youtube 1.mp3", "/m.mp3", 0, 69538, 0),
+] };
+let err = null; try { requireSimpleTimeline(nestTl); } catch (e) { err = e.message; }
+check("nested V1 + external A1 is accepted for auto retakes", err === null);
+check("A1 is the only transcript source under a nested V1", transcriptSourceClips(nestTl).map(c => c.mediaPath).join() === "/m.mp3");
+const withCam = { ...nestTl, clips: [...nestTl.clips, clip("audio", 1, "A CAM", "/cam.mp4", 0, 69539, 30000)] };
+check("camera audio on A2 is cut along but not transcribed twice", transcriptSourceClips(withCam).length === 1 && transcriptSourceClips(withCam)[0].trackIndex === 0);
+err = null; try { requireSimpleTimeline(withCam); } catch (e) { err = e.message; }
+check("extra aligned audio track is accepted", err === null);
+const g = expectedGeometry(nestTl, [{ startFrame: 100, endFrame: 200 }], true);
+check("ripple shifts nested V1 and A1 identically", g.filter(x => x.start === String(100n * TB)).length === 2);
+const title = { ...nestTl, clips: [...nestTl.clips, clip("video", 1, "Title", null, 0, 50, 0, { isNested: false })] };
+err = null; try { requireSimpleTimeline(title); } catch (e) { err = e.message; }
+check("a title (no media, not nested) is still refused, naming the clip", /V2 "Title"/.test(err || "") || /video2 "Title"/.test(err || ""));
+const slow = { ...nestTl, clips: [clip("video", 0, "Multicam setup", null, 0, 69539, 13990, { speedIsNormal: false }), nestTl.clips[1]] };
+err = null; try { requireSimpleTimeline(slow); } catch (e) { err = e.message; }
+check("a retimed nest is still refused", /100% forward speed/.test(err || ""));
 
 if (failed) { console.log(`${failed} reliable-fix check(s) failed.`); process.exit(1); }
 console.log("All reliable-fix checks passed.");

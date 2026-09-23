@@ -8,7 +8,7 @@ import { groupIntoPhrases, sliceWordsToWindow } from "./transcription/segments.j
 import { sourceRangeToTimelineFrames, sourceSecToTimeline, timelineFrameToSourceTicks } from "./transcription/timecode.js";
 import { captureUndo } from "./undo.js";
 import { applyRangesBatched } from "./silences.js";
-import { timelineFingerprint } from "./retakes/timeline-safety.js";
+import { timelineFingerprint, transcriptSourceClips } from "./retakes/timeline-safety.js";
 import { buildRetakeV2Document } from "./retake-v2.js";
 
 // A clip is split into phrases on an internal pause >= this (sub-clip false
@@ -102,8 +102,8 @@ export async function buildReview(ctx, opts = {}, onProgress = () => {}) {
     if (!c) throw new Error(`No clip "${opts.clipId}". Call ppro_get_timeline_state for ids.`);
     clips = [c];
   } else {
-    clips = timeline.clips.filter((c) => c.hasMedia && c.trackType === "video");
-    if (clips.length === 0) clips = timeline.clips.filter((c) => c.hasMedia);
+    // Never every audio track: A1 + camera audio would transcribe the speech twice.
+    clips = transcriptSourceClips(timeline);
   }
   if (clips.length === 0) throw new Error("No clips with source media on the timeline.");
 

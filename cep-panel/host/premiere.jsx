@@ -231,10 +231,12 @@ $.editagent = (function () {
             end: { ticks: String(clip.start.ticks), seconds: startSec }
           });
         }
-        var mediaPath = "";
+        var mediaPath = "", nested = false;
         try {
           if (clip.projectItem) mediaPath = clip.projectItem.getMediaPath();
         } catch (e) {}
+        // A nested/multicam sequence has no media path but razors and moves like any clip.
+        try { nested = !mediaPath && !!clip.projectItem && !!clip.projectItem.isSequence(); } catch (eNest) {}
         var locked = null, disabled = null, transitions = null, speed = null, reversed = null;
         try { locked = !!track.isLocked(); } catch (eLock) {}
         try { disabled = !!clip.disabled; } catch (eDisabled) {}
@@ -253,6 +255,7 @@ $.editagent = (function () {
           trackIndex: i,
           itemIndex: j,
           mediaPath: mediaPath,
+          isNested: nested,
           start: { ticks: String(clip.start.ticks), seconds: startSec },
           end: { ticks: String(clip.end.ticks), seconds: endSec },
           inPoint: { ticks: String(clip.inPoint.ticks), seconds: clip.inPoint.seconds },

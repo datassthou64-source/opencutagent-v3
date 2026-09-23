@@ -14,29 +14,50 @@ export function timelineFingerprint(timeline) {
   })).digest('hex');
 }
 
-/** Current all-track host engine is safe only for this deliberately narrow topology. */
+/**
+ * Clips whose audio is the transcript: the camera video's own media when it has any,
+ * otherwise the lowest populated audio track (e.g. A1 under a nested/multicam V1).
+ */
+export function transcriptSourceClips(timeline) {
+  const video = timeline.clips.filter(c => c.hasMedia && c.trackType === 'video');
+  if (video.length) return video;
+  const audio = timeline.clips.filter(c => c.hasMedia && c.trackType === 'audio');
+  if (!audio.length) return [];
+  const lowest = Math.min(...audio.map(c => c.trackIndex));
+  return audio.filter(c => c.trackIndex === lowest);
+}
+
+/**
+ * Cuts are whole timeline frame ranges razored and lifted on EVERY track, then closed by
+ * one uniform shift, so sync holds for any track layout. What the engine cannot do safely
+ * is retimed, reversed, transitioned, locked, disabled or overlapping clips, or items that
+ * are neither source media nor a nested sequence (titles, generators, adjustment layers).
+ */
 export function requireSimpleTimeline(timeline) {
   const seq = timeline.sequence;
   if (!seq.id || seq.captionTrackCount !== 0) throw new Error('Auto retakes require a sequence without caption tracks and a current host script. Reload the panel.');
-  const video = timeline.clips.filter(c => c.trackType === 'video');
-  const audio = timeline.clips.filter(c => c.trackType === 'audio');
-  if (!video.length || video.length !== audio.length || new Set(video.map(c => c.trackIndex)).size !== 1 || new Set(audio.map(c => c.trackIndex)).size !== 1) {
-    throw new Error('Auto retakes support one populated video track and one matching camera-audio track. Use Analyze retakes for other layouts.');
-  }
+  if (!transcriptSourceClips(timeline).length) throw new Error('Auto retakes need a video or audio track with source media to transcribe. Use Analyze retakes for other layouts.');
+  const tb = BigInt(seq.timebase);
   for (const c of timeline.clips) {
-    if (!c.hasMedia || !c.speedIsNormal || c.speedReversed !== false || c.trackLocked !== false || c.disabled !== false || c.transitionCount !== 0) {
-      throw new Error('Auto retakes require unlocked, enabled, normal-speed media without transitions. Other layouts can use Analyze retakes.');
-    }
+    const where = `${c.track || c.trackType + (c.trackIndex + 1)} "${c.name || ''}"`;
+    if (!c.hasMedia && !c.isNested) throw new Error(`Auto retakes can only cut source media or nested sequences; ${where} is neither (title, graphic or adjustment layer?). Use Analyze retakes.`);
+    if (!c.speedIsNormal || c.speedReversed !== false) throw new Error(`Auto retakes require 100% forward speed; ${where} is retimed. Use Analyze retakes.`);
+    if (c.trackLocked !== false || c.disabled !== false) throw new Error(`Auto retakes require unlocked, enabled clips; ${where} is locked or disabled.`);
+    if (c.transitionCount !== 0) throw new Error(`Auto retakes require tracks without transitions; ${where} has one.`);
     if (BigInt(c.end.ticks) - BigInt(c.start.ticks) !== BigInt(c.sourceOut.ticks) - BigInt(c.sourceIn.ticks)) throw new Error("Retimed source ranges need manual review.");
-    const tb = BigInt(seq.timebase);
     if ([c.start, c.end].some(t => BigInt(t.ticks) % tb !== 0n)) throw new Error('Auto retakes require frame-aligned clip edges.');
   }
-  const key = c => JSON.stringify([c.mediaPath, c.start.ticks, c.end.ticks, c.sourceIn.ticks, c.sourceOut.ticks]);
-  const aa = audio.map(key).sort(), vv = video.map(key).sort();
-  if (JSON.stringify(aa) !== JSON.stringify(vv)) throw new Error('Camera audio and video must have identical source ranges and timeline positions for automatic cuts.');
-  video.sort((a, b) => a.start.seconds - b.start.seconds);
-  for (let i = 1; i < video.length; i++) {
-    if (BigInt(video[i].start.ticks) < BigInt(video[i - 1].end.ticks)) throw new Error('Overlapping clips need manual review.');
+  const byTrack = new Map();
+  for (const c of timeline.clips) {
+    const k = c.trackType + c.trackIndex;
+    if (!byTrack.has(k)) byTrack.set(k, []);
+    byTrack.get(k).push(c);
+  }
+  for (const clips of byTrack.values()) {
+    clips.sort((a, b) => a.start.seconds - b.start.seconds);
+    for (let i = 1; i < clips.length; i++) {
+      if (BigInt(clips[i].start.ticks) < BigInt(clips[i - 1].end.ticks)) throw new Error('Overlapping clips need manual review.');
+    }
   }
 }
 
