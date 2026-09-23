@@ -498,7 +498,7 @@ export async function applyReview(ctx, { removeGaps = false, trimExcess = false,
   const applied = res.applied;
   if (applied > 0) {
     ctx.state.revision += 1;
-    if (timeline) captureUndo(ctx, "retake", timeline, { ripple, applied });
+    if (timeline) captureUndo(ctx, "retake", timeline, { ripple, applied, markerMoves: res.markerMoves });
   }
   return {
     applied,

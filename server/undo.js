@@ -10,6 +10,7 @@
 // apply), and the result is verified here — with Cmd+Z always available as the
 // guaranteed fallback.
 import { getTimeline } from "./tools/util.js";
+import { reverseMarkerMoves } from "./silences.js";
 
 /** Capture the pre-apply timeline so it can be restored later. */
 export function snapshotTimeline(timeline) {
@@ -71,6 +72,16 @@ export async function restoreUndo(ctx) {
     return { ok: false, kind, reason: res && res.reason, message: `Couldn't auto-undo (${(res && res.reason) || "the timeline changed since the apply"}). Press Cmd+Z in Premiere.` };
   }
 
+  // Markers were rippled with the cuts; put them back too (best effort, like verify).
+  let markersRestored = null;
+  const moves = ctx.undo.meta?.markerMoves;
+  if (moves?.length) {
+    try {
+      const m = await ctx.bridge.callHost("setMarkerPositions", { moves: reverseMarkerMoves(moves) }, { timeoutMs: 120000 });
+      markersRestored = m?.ok === true;
+    } catch { markersRestored = false; }
+  }
+
   let verified = false;
   try {
     const after = await getTimeline(ctx);
@@ -86,9 +97,11 @@ export async function restoreUndo(ctx) {
     verified,
     kind,
     restoredTracks: res.restoredTracks,
+    markersRestored,
     revision: ctx.state.revision,
-    message: verified
+    message: (verified
       ? "Reverted the timeline to before the last apply."
-      : "Restored the timeline. Quickly verify it looks right (Cmd+Z in Premiere if anything is off).",
+      : "Restored the timeline. Quickly verify it looks right (Cmd+Z in Premiere if anything is off).") +
+      (markersRestored === false ? " Some markers could not be moved back; check them." : ""),
   };
 }

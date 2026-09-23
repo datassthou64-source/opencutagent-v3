@@ -72,7 +72,9 @@ check("summarize matches", summarize(ctx.review).keep === 2);
 const res = await applyReview(ctx, { removeGaps: true });
 check("applies 2 cuts (protected skipped)", res.applied === 2, res);
 check("one batch call, ranges ascending", ctx.calls[0].ranges && ctx.calls[0].ranges[0].startFrame === 20 && ctx.calls[0].ranges[1].startFrame === 60, ctx.calls);
-check("removeGaps → one closeRangeGaps pass", ctx.calls.length === 2 && ctx.calls[1].ranges.length === 2, ctx.calls);
+// A trailing listMarkers call (markers ride the ripple) is not a cut call.
+const cutCalls = ctx.calls.filter((c) => c.ranges);
+check("removeGaps → one closeRangeGaps pass", cutCalls.length === 2 && cutCalls[1].ranges.length === 2, ctx.calls);
 check("protected frame 40 not cut", !ctx.calls[0].ranges.some((r) => r.startFrame === 40), ctx.calls[0].ranges);
 
 // --- cut frames come from integer TICKS, not from rounded seconds ---

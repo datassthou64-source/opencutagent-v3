@@ -1016,6 +1016,65 @@ $.editagent = (function () {
     return false;
   }
 
+  // Every sequence marker with its exact span. Markers belong to the sequence, not to
+  // clips, so scripted ripple moves (closeRangeGaps) leave them behind; the server
+  // maps these through the removed ranges and moves them with setMarkerPositions.
+  function allMarkers(seq) {
+    var out = [], mk = null;
+    try { mk = seq.markers.getFirstMarker(); } catch (e) { return out; }
+    while (mk) {
+      out.push(mk);
+      try { mk = seq.markers.getNextMarker(mk); } catch (e2) { mk = null; }
+    }
+    return out;
+  }
+
+  function markerGuid(mk) {
+    try { return mk.guid ? String(mk.guid) : ""; } catch (e) { return ""; }
+  }
+
+  function listMarkers() {
+    var seq = requireSeq(), list = allMarkers(seq), out = [];
+    for (var i = 0; i < list.length; i++) {
+      try { out.push({ index: i, guid: markerGuid(list[i]), startTicks: String(list[i].start.ticks), endTicks: String(list[i].end.ticks) }); } catch (e) {}
+    }
+    return { sequenceId: String(seq.sequenceID), timebase: String(seq.timebase), markers: out };
+  }
+
+  // Each move names the marker (guid, else index) AND its current span, so a marker
+  // the user moved in the meantime is left alone and reported instead of misplaced.
+  function setMarkerPositions(p) {
+    var seq = requireSeq();
+    if (p.expectedSequenceId && String(seq.sequenceID) !== p.expectedSequenceId) throw new Error("Active sequence changed; markers not moved.");
+    var list = allMarkers(seq), moves = p.moves || [], half = Number(seq.timebase) / 2;
+    var moved = 0, missing = 0, misplaced = 0, i, j;
+    // Collect first, then move: repositioning can reorder the collection mid-walk.
+    var spans = [];
+    for (i = 0; i < list.length; i++) {
+      try { spans.push({ mk: list[i], guid: markerGuid(list[i]), s: String(list[i].start.ticks), e: String(list[i].end.ticks) }); } catch (e) { spans.push(null); }
+    }
+    for (i = 0; i < moves.length; i++) {
+      var m = moves[i], hit = null;
+      for (j = 0; j < spans.length && !hit; j++) {
+        var c = spans[j];
+        if (!c || c.used) continue;
+        // Half-frame slack: Premiere stores a seconds assignment to the nearest tick, so
+        // an undo's recorded "from" can differ from the placed marker by a few ticks.
+        if ((m.guid ? c.guid === m.guid : j === m.index) && Math.abs(Number(c.s) - Number(m.fromStartTicks)) <= half && Math.abs(Number(c.e) - Number(m.fromEndTicks)) <= half) hit = c;
+      }
+      if (!hit) { missing++; continue; }
+      hit.used = true;
+      var startSec = Number(m.toStartTicks) / TPS, endSec = Number(m.toEndTicks) / TPS;
+      try { hit.mk.start = startSec; } catch (eS) { try { hit.mk.start.seconds = startSec; } catch (eS2) {} }
+      setMarkerSpan(hit.mk, endSec);
+      var okStart = false, okEnd = false;
+      try { okStart = Math.abs(Number(hit.mk.start.ticks) - Number(m.toStartTicks)) <= half; } catch (eV) {}
+      try { okEnd = Math.abs(Number(hit.mk.end.ticks) - Number(m.toEndTicks)) <= half; } catch (eV2) {}
+      if (okStart && okEnd) moved++; else misplaced++;
+    }
+    return { ok: missing === 0 && misplaced === 0, moved: moved, missing: missing, misplaced: misplaced, requested: moves.length };
+  }
+
   function markerIndexOf(markers, target) {
     // Position of `target` within the collection (for the 2-arg setColorByIndex form),
     // computed so a fallback NEVER recolors someone else's marker.
@@ -1186,6 +1245,8 @@ $.editagent = (function () {
     getPlayhead: getPlayhead,
     reinsertSegment: reinsertSegment,
     restoreTimeline: restoreTimeline,
+    listMarkers: listMarkers,
+    setMarkerPositions: setMarkerPositions,
     applyEditMarkers: applyEditMarkers,
     applyReviewMarkers: applyReviewMarkers,
     clearEditMarkers: clearEditMarkers,

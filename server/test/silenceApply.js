@@ -1,6 +1,7 @@
 // Checks for the silence apply path (no ffmpeg/Premiere): source-second ranges
 // map to the right timeline frames, apply right-to-left, and mode → ripple/mute.
-import { resolveRangesToFrames, applySilenceRanges, computeRangesForSession, framesToCutList, mergeFrameRanges } from "../silences.js";
+import { resolveRangesToFrames, applySilenceRanges, computeRangesForSession, framesToCutList, mergeFrameRanges, markerMoves, reverseMarkerMoves } from "../silences.js";
+import { restoreUndo } from "../undo.js";
 import { TICKS_PER_SECOND } from "../transcription/timecode.js";
 
 const TPS = Number(TICKS_PER_SECOND);
@@ -164,6 +165,57 @@ const silence = {
 const sessRanges = computeRangesForSession(silence);
 check("session ranges tagged with clipId", sessRanges.length === 1 && sessRanges[0].clipId === "V1.0", sessRanges);
 check("session range ~1.12..1.88s", Math.abs(sessRanges[0].srcStart - 1.12) < 1e-9 && Math.abs(sessRanges[0].srcEnd - 1.88) < 1e-9, sessRanges[0]);
+
+// --- markers ride along with a ripple (they belong to the sequence, not the clips) ---
+{
+  const TB = BigInt(tb), f = n => String(BigInt(n) * TB);
+  const marks = [
+    { index: 0, guid: "before", startTicks: f(100), endTicks: f(200) },   // before every cut: stays
+    { index: 1, guid: "after", startTicks: f(600), endTicks: f(650) },    // after both cuts: -60 frames
+    { index: 2, guid: "spans", startTicks: f(320), endTicks: f(460) },    // edges inside both cuts
+    { index: 3, guid: "inside", startTicks: f(305), endTicks: f(325) },   // wholly in a silence
+    { index: 4, guid: "", startTicks: f(400), endTicks: f(400) },         // point marker, no guid
+  ];
+  const cuts = [{ startFrame: 300, endFrame: 330 }, { startFrame: 450, endFrame: 480 }];
+  const mv = markerMoves(marks, cuts, tb);
+  const by = g => mv.find(m => m.guid === g);
+  check("marker before the cuts is not moved", !by("before"), mv);
+  check("marker after both cuts shifts by 60 frames", by("after")?.toStartTicks === f(540) && by("after").toEndTicks === f(590), by("after"));
+  check("marker edges inside cuts snap to the joins", by("spans")?.toStartTicks === f(300) && by("spans").toEndTicks === f(420), by("spans"));
+  check("marker wholly inside a silence collapses onto the join", by("inside")?.toStartTicks === f(300) && by("inside").toEndTicks === f(300), by("inside"));
+  const pt = mv.find(m => m.index === 4);
+  check("guid-less point marker shifts by the first cut", pt?.toStartTicks === f(370) && pt.toEndTicks === f(370), pt);
+  const back = reverseMarkerMoves(mv);
+  check("undo moves are the exact inverse", back.every((b, i) => b.fromStartTicks === mv[i].toStartTicks && b.toEndTicks === mv[i].fromEndTicks), back);
+
+  // End to end through applySilenceRanges (remove) with a fake host, then undo.
+  const calls = [];
+  const ctx = { state: { revision: 0 }, cacheDir: "/tmp", bridge: { notifyPanel: () => {},
+    callHost: async (action, params) => {
+      if (action === "getTimelineState") return RAW_TIMELINE;
+      calls.push({ action, ...params });
+      if (action === "removeRangesBatch") return { ok: true, removedIndexes: params.ranges.map((_, k) => k) };
+      if (action === "listMarkers") return { sequenceId: "S", timebase: tb, markers: marks };
+      if (action === "setMarkerPositions") return { ok: true, moved: params.moves.length, missing: 0, misplaced: 0 };
+      if (action === "restoreTimeline") return { ok: true, restoredTracks: 1 };
+      return { ok: true };
+    } } };
+  const res = await applySilenceRanges(ctx, { ranges: ranges.slice(0, 2), mode: "remove" });
+  const order = calls.map(c => c.action);
+  const set = calls.find(c => c.action === "setMarkerPositions");
+  check("markers are moved after the gaps close", order.indexOf("setMarkerPositions") > order.indexOf("closeRangeGaps"), order);
+  check("apply moves 4 markers for the sequence it read", set?.moves.length === 4 && set.expectedSequenceId === "S", set);
+  check("no marker errors reported", !(res.errors || []).length, res.errors);
+  calls.length = 0;
+  await restoreUndo(ctx);
+  const undoSet = calls.find(c => c.action === "setMarkerPositions");
+  check("undo puts markers back", undoSet?.moves.length === 4 && undoSet.moves.find(m => m.guid === "after").toStartTicks === f(600), undoSet);
+
+  // Keep-spaces (lift) mode leaves gaps, so markers must NOT move.
+  calls.length = 0;
+  await applySilenceRanges(ctx, { ranges: ranges.slice(0, 2), mode: "keepSpaces" });
+  check("keep-spaces mode does not move markers", !calls.some(c => c.action === "setMarkerPositions"), calls.map(c => c.action));
+}
 
 console.log(failures === 0 ? "\nAll silence-apply checks passed." : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

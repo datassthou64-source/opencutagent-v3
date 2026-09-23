@@ -92,7 +92,8 @@ check("absent footage is counted, never cut at stale frames", gone.frames.length
     },
   };
   const applied = await applyRetakeV2(ctx, [{ startWord: 1, endWord: 2 }], { removeGaps: true });
-  check("apply uses one batch plus one close-gaps pass", calls.length === 2 && calls[0].action === "removeRangesBatch" && calls[1].action === "closeRangeGaps", calls);
+  const cutCalls = calls.filter((c) => c.action !== "listMarkers"); // markers ride the ripple
+  check("apply uses one batch plus one close-gaps pass", cutCalls.length === 2 && cutCalls[0].action === "removeRangesBatch" && cutCalls[1].action === "closeRangeGaps", calls);
   check("apply captures a V2 undo snapshot", applied.undoable && ctx.undo && ctx.undo.kind === "retake-v2", ctx.undo);
   check("apply bumps the shared timeline revision", applied.revision === 1 && ctx.state.revision === 1, applied);
 }

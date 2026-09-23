@@ -101,7 +101,7 @@ const FRAMES = CUTS.map((c) => ({ ...c }));
 const ctxR = makeCtx();
 const rr = await applyRangesBatched(ctxR, FRAMES, { ripple: true, fps: 30, timeline: TIMELINE, rebuildMin: 1 });
 check("large ripple apply never exports or imports XML", !ctxR.calls.some((c) => /XmlSequence$/.test(c.action)), ctxR.calls);
-check("large ripple apply razors and closes gaps in place", ctxR.calls.map((c) => c.action).join(",") === "removeRangesBatch,closeRangeGaps", ctxR.calls);
+check("large ripple apply razors and closes gaps in place", ctxR.calls.map((c) => c.action).filter((a) => a !== "listMarkers").join(",") === "removeRangesBatch,closeRangeGaps", ctxR.calls);
 check("in-place result reports both cuts applied", !rr.rebuild && rr.applied === 2 && Math.abs(rr.appliedSec - 4) < 1e-6, rr);
 
 console.log(failures === 0 ? "\nAll xml-rebuild checks passed." : `\n${failures} check(s) failed.`);

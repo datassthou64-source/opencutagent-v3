@@ -203,6 +203,55 @@ const APPLY_CHUNK = 50;
  * nothing shifts, so chunk order is free and cancel works between chunks), then
  * ONE closeRangeGaps pass when rippling (each surviving clip moves once).
  */
+/**
+ * Where each sequence marker lands after `removed` frame ranges (ascending, merged) are
+ * rippled out. A marker edge inside a removed range goes to the cut point, so a marker
+ * that sat wholly in a silence collapses onto the join instead of drifting away.
+ */
+export function markerMoves(markers, removed, timebase) {
+  const tb = BigInt(timebase);
+  const spans = removed.map(r => ({ a: BigInt(r.startFrame) * tb, b: BigInt(r.endFrame) * tb }));
+  const map = t => {
+    let out = t;
+    for (const r of spans) {
+      if (r.b <= t) out -= r.b - r.a;
+      else if (r.a < t) out -= t - r.a;
+      else break;
+    }
+    return out;
+  };
+  const moves = [];
+  for (const m of markers || []) {
+    const s = BigInt(m.startTicks), e = BigInt(m.endTicks), s2 = map(s), e2 = map(e);
+    if (s2 === s && e2 === e) continue;
+    moves.push({ guid: m.guid || "", index: m.index, fromStartTicks: String(s), fromEndTicks: String(e), toStartTicks: String(s2), toEndTicks: String(e2) });
+  }
+  return moves;
+}
+
+/** Inverse moves, used by undo to put markers back where they were. */
+export function reverseMarkerMoves(moves) {
+  return (moves || []).map(m => ({ ...m, fromStartTicks: m.toStartTicks, fromEndTicks: m.toEndTicks, toStartTicks: m.fromStartTicks, toEndTicks: m.fromEndTicks }));
+}
+
+/** Move every sequence marker along with a ripple. Never throws: the cuts already happened. */
+async function rippleMarkers(ctx, removed, errors) {
+  try {
+    const listed = await callHostHealing(ctx, "listMarkers", {});
+    if (!Array.isArray(listed?.markers) || !listed.markers.length || !listed.timebase) return [];
+    const moves = markerMoves(listed.markers, mergeFrameRanges(removed), listed.timebase);
+    if (!moves.length) return [];
+    const res = await callHostHealing(ctx, "setMarkerPositions", { moves, expectedSequenceId: listed.sequenceId }, { timeoutMs: 120000 });
+    if (res && (res.missing > 0 || res.misplaced > 0)) {
+      errors.push({ at: -1, error: `Moved ${res.moved}/${moves.length} marker(s) with the cuts; ${res.missing + res.misplaced} could not be moved. Check markers after the last cut.` });
+    }
+    return moves;
+  } catch (e) {
+    errors.push({ at: -1, error: `markers: ${e.message}. Cuts are fine, but markers were not shifted.` });
+    return [];
+  }
+}
+
 export async function applyRangesBatched(ctx, frames, { ripple = true, fps = 30, chunkSize, onProgress = () => {} } = {}) {
   const merged = mergeFrameRanges(frames);
 
@@ -212,6 +261,7 @@ export async function applyRangesBatched(ctx, frames, { ripple = true, fps = 30,
   let aborted = false;
   const errors = [];
   const processed = [];
+  const removed = []; // ranges Premiere confirmed deleted; markers shift by exactly these
   for (let i = 0; i < merged.length; i += size) {
     if (isAborted(ctx)) { aborted = true; break; }
     const chunk = merged.slice(i, i + size);
@@ -221,7 +271,7 @@ export async function applyRangesBatched(ctx, frames, { ripple = true, fps = 30,
       const idxs = (res && Array.isArray(res.removedIndexes) ? res.removedIndexes : chunk.map((_, k) => k))
         .filter((k) => Number.isInteger(k) && k >= 0 && k < chunk.length); // a malformed host reply must not corrupt the accounting
       applied += idxs.length;
-      for (const k of idxs) appliedSec += (chunk[k].endFrame - chunk[k].startFrame) / fps;
+      for (const k of idxs) { appliedSec += (chunk[k].endFrame - chunk[k].startFrame) / fps; removed.push(chunk[k]); }
       // The host no longer swallows these. A clip Premiere refused to delete, or a
       // piece whose razor landed off the requested frame, means that span is still
       // on the timeline — say so instead of reporting a clean "applied N/N".
@@ -252,8 +302,11 @@ export async function applyRangesBatched(ctx, frames, { ripple = true, fps = 30,
       errors.push({ at: -1, error: `close gaps: ${e.message}` });
     }
   }
+  // Markers stay put when clips are moved by script, so review markers would drift
+  // away from their footage. Ripple them with the same ranges.
+  const movedMarkers = ripple && applied > 0 ? await rippleMarkers(ctx, removed, errors) : [];
   if (errors.length) log(`applyRangesBatched: ${errors.length} error(s), first:`, errors[0].error);
-  return { applied, appliedSec: round3(appliedSec), requested: merged.length, aborted, errors };
+  return { applied, appliedSec: round3(appliedSec), requested: merged.length, aborted, errors, markerMoves: movedMarkers };
 }
 
 /**
@@ -282,6 +335,7 @@ export async function applySilenceRanges(ctx, { ranges = [], mode = "remove", tr
   let aborted = false;
   let requested = frames.length;
   let errors = [];
+  let movedMarkers = [];
   if (mode === "mute") {
     frames.sort((a, b) => b.startFrame - a.startFrame);
     for (let i = 0; i < frames.length; i++) {
@@ -302,11 +356,12 @@ export async function applySilenceRanges(ctx, { ranges = [], mode = "remove", tr
     aborted = res.aborted;
     requested = res.requested;
     errors = res.errors;
+    movedMarkers = res.markerMoves;
   }
   const removedSeconds = round3(appliedSec);
   if (applied > 0) {
     ctx.state.revision += 1;
-    captureUndo(ctx, "silence", timeline, { mode, applied });
+    captureUndo(ctx, "silence", timeline, { mode, applied, markerMoves: movedMarkers });
   }
 
   // Transition styles (J/L-cut, crossfades) are recorded but v1 applies clean

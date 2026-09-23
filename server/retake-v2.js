@@ -326,7 +326,7 @@ export async function applyRetakeV2(ctx, ranges, { removeGaps = true, chunkSize 
     onProgress,
   });
   if (res.applied > 0) {
-    captureUndo(ctx, "retake-v2", timeline, { ripple: removeGaps === true, applied: res.applied });
+    captureUndo(ctx, "retake-v2", timeline, { ripple: removeGaps === true, applied: res.applied, markerMoves: res.markerMoves });
     ctx.state.revision += 1;
   }
   return { ...res, alreadyGone: planned.alreadyGone, undoable: res.applied > 0, revision: ctx.state.revision };
