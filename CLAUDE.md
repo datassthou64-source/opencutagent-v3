@@ -18,6 +18,13 @@ OpenCutAgent (formerly EditAgent; the local folder is still `editagent/`) is a P
 4. `ppro_apply_retakes` (`remove_gaps:true` = ripple/tight) **or** the panel's Apply All.
 5. **VERIFY by re-reading the timeline** (clip count + duration), not the "applied" count.
 
+## Git workflow (owner's standing rule)
+- **`main` on `private-origin` (github.com/datassthou64-source/opencutagent-v3, PUBLIC) is the live version other people install.** Every finished, tested change ends up there: commit, run `cd server && npm test && npm run check`, then push to `private-origin main`. Pushing to `private-origin main` is pre-approved; don't ask.
+- **Keep branches clean:** work on `main` directly for normal fixes. Use a short-lived branch only for large, unfinished work; merge it into `main` once it works, then delete it locally and on `private-origin`. Don't leave finished work sitting on a side branch.
+- **Never push to `upstream`** (leonardogrig/opencutagent): it's someone else's repo and we only have read access. Offer a PR instead if a change should go there.
+- **Never commit** `.env`, `.mcp.json`, or anything under `.cache/` (logs, levels, transcripts).
+- A running server keeps old code in memory: after pushing server changes, remind the user to restart the server (see "Loading code changes").
+
 ## Lessons learned — READ before using the MCP (append when you learn a new one)
 
 - **Apply is in-place only (2026-08-08):** silence and retake applies always use the batched razor→lift→close path on the active sequence. The XML rebuild/round-trip helpers are dormant and `EDITAGENT_REBUILD_MIN` / `EDITAGENT_ROUNDTRIP` are no longer exposed. Large applies may take longer, but must not create or open a `- tightened` sequence. Capture the normal undo snapshot before reporting success.
